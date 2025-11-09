@@ -200,6 +200,7 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
 
         self._init_executor()
 
+
     def _init_executor(self) -> None:
         # Create the parallel GPU workers.
 
@@ -345,6 +346,10 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
     def create_stubs(self, server_list):
         self.preset_server_list = server_list
         self.stub_list = [comm_pb2_grpc.CommServiceStub(aio.insecure_channel(server)) for server in server_list]
+
+        # TODO 删除以下测试内容
+        # print(type(self.driver_worker.worker.model_runner))
+        # self.driver_worker.worker.model_runner.offload_weight()
 
 
     async def execute_model_async(

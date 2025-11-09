@@ -23,6 +23,7 @@ from vllm.distributed import broadcast_tensor_dict
 from molink.distributed.parallel_state import ensure_model_parallel_initialized
 from molink.worker.model_runner import MolinkGPUModelRunner
 
+# zyflog：真实管理模型的类
 class MolinkWorker(Worker):
 
     def __init__(
