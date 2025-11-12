@@ -20,11 +20,28 @@ from vllm.model_executor.layers.sampler import (Sampler, SamplerOutput)
 from vllm.multimodal import MultiModalKwargs
 from vllm.sequence import IntermediateTensors
 import time
+from molink.model_executor.models.utils import set_cpu_offload_max_bytes
+from vllm.config import VllmConfig
+from vllm.inputs import INPUT_REGISTRY, InputRegistry
+from vllm.multimodal import (MULTIMODAL_REGISTRY, MultiModalRegistry)
 
 
 logger = init_logger(__name__)
 
 class MolinkGPUModelRunner(ModelRunner):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_dtype: Optional[str] = "auto",
+        is_driver_worker: bool = False,
+        return_hidden_states: bool = False,
+        input_registry: InputRegistry = INPUT_REGISTRY,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+    ):        
+        super().__init__(vllm_config, kv_cache_dtype, is_driver_worker, return_hidden_states, input_registry, mm_registry)
+        set_cpu_offload_max_bytes(int(self.cache_config.cpu_offload_gb * 1024**3))
+
+
     def load_model(self) -> None:
         #zyflog：真实加载模型函数
         logger.info("Starting to load model %s...", self.model_config.model)
@@ -36,7 +53,7 @@ class MolinkGPUModelRunner(ModelRunner):
                     self.model_memory_usage / float(2**30))
 
         # TODO test
-        self.offload_weight()
+        # self.offload_weight()
 
         if self.lora_config:
             assert supports_lora(

@@ -368,17 +368,8 @@ class LlamaModel(nn.Module):
         for idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-
-            print(f"start to calculate layer {idx}  {time.time()}", flush=True)
-            # with open('/env/offloading.log', 'a') as f:
-            #     f.write(f"start to calculate layer {idx}  {time.time()}\n")
-            # todo check layer in GPU??
-            if idx == 5:
-                layer.to(torch.device('cuda'))
+                
             hidden_states, residual = layer(positions, hidden_states, residual)
-            print(f"finish calculate layer {idx}  {time.time()}", flush=True)
-            # with open('/env/offloading.log', 'a') as f:
-            #     f.write(f"finish calculate layer {idx}  {time.time()}\n")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({

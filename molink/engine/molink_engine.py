@@ -289,6 +289,7 @@ class _MolinkEngine(_AsyncLLMEngine):
             profiled_latency = (te - ts) * 1000
             prefill_table = self.profile_data.get('prefill')
             prefill_table.update({batched_token_num : profiled_latency})
+            print(f"profiled_latency == {profiled_latency}", flush=True)
 
         print('Profile of prefill latency finished.')
         #print('Prefill latency stats: ')
@@ -330,6 +331,8 @@ class _MolinkEngine(_AsyncLLMEngine):
             profiled_latency = (te - ts) * 1000
             decode_table = self.profile_data.get('decode')
             decode_table.update({batch_size : profiled_latency})
+
+        # print(f"profile_data == {self.profile_data}")
 
         print('Profile of decode latency finished.')
         #print('Decode latency stats: ')

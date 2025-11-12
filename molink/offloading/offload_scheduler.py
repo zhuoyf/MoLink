@@ -1,0 +1,2 @@
+class MolinkOffloadScheduler():
+    pass

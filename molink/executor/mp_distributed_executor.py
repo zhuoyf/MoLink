@@ -129,6 +129,9 @@ class MultiprocessingDeliver(mp.Process):
                     None, 
                     self.process_queue.get
                 )
+                print(f"execute_model_req == {execute_model_req}", flush=True)
+                # if "is_prompt=False" in str(execute_model_req):
+                #     print("hello")
 
                 if push_type == 'next':
                     bytes_emr, grpc_intermediate_tensors = self.mp_serialize_intermediate_tensors(intermediate_tensors_or_sampler_outputs,\
