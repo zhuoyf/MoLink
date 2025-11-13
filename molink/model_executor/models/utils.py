@@ -13,6 +13,7 @@ from molink.model_executor.model_loader.utils import get_model_architecture
 from vllm.utils import (get_cuda_view_from_cpu_tensor, is_pin_memory_available,
                         is_uva_available)
 import vllm.envs as envs
+from molink.offloading.offload_scheduler import MolinkOffloadScheduler
 
 def get_pp_indices(config: MolinkConfig) -> Tuple[int, int]:
     
@@ -24,17 +25,13 @@ def get_pp_indices(config: MolinkConfig) -> Tuple[int, int]:
     return (start_layer, end_layer)
 
 
-_CPU_OFFLOAD_BYTES = 0
-_CPU_OFFLOAD_MAX_BYTES = 0
-
 def set_cpu_offload_max_bytes(max_bytes: int) -> None:
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    _CPU_OFFLOAD_BYTES = 0
-    _CPU_OFFLOAD_MAX_BYTES = max_bytes
+    MolinkOffloadScheduler._CPU_OFFLOAD_BYTES = 0
+    # MolinkOffloadScheduler._CPU_OFFLOAD_MAX_BYTES = max_bytes
+    MolinkOffloadScheduler._CPU_OFFLOAD_MAX_BYTES = 0
+
     
-def maybe_offload_to_cpu(module: torch.nn.Module, prefix: str) -> torch.nn.Module:
-    print(f"prefix: {prefix}")
-    module._layer_idx = prefix
+def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
     if (params := next(module.parameters(), None)) is None:
         return module
@@ -88,7 +85,7 @@ def maybe_offload_to_cpu(module: torch.nn.Module, prefix: str) -> torch.nn.Modul
     if offloaded_parameters and not uva_offloading:
         original_forward = module.forward
 
-        def forward(*args, _layer_idx=prefix, **kwargs):
+        def forward(*args, **kwargs):
             module.forward = original_forward
             # print(type(module.state_dict().items()))
             # print(type(module.state_dict()))
@@ -100,12 +97,10 @@ def maybe_offload_to_cpu(module: torch.nn.Module, prefix: str) -> torch.nn.Modul
             }
 
             # print("device_state devices:", {k: v.device for k, v in device_state.items()})
-            print(f"开始计算层{module._layer_idx}")
             output = functional_call(module,
                                      device_state,
                                      args=args,
                                      kwargs=kwargs)
-            print(f"结束计算层{module._layer_idx}")
             module.forward = forward
             return output
 
@@ -123,11 +118,29 @@ def make_layers(
     pipeline parallelism into account.
     """
     start_layer, end_layer = get_pp_indices(config)
+    
+    scheduler = MolinkOffloadScheduler(
+        device=torch.device("cuda:0"),
+        num_layers=(end_layer - start_layer),
+        #todo
+        cpu_offload_max_bytes=0
+    )
+
+    layers = []
+    for i, global_idx in enumerate(range(start_layer, end_layer)):
+        layer = layer_fn(prefix=f"{prefix}.{global_idx}")
+        # 为每层注册 & 执行 maybe_offload_to_cpu（会安装 forward 包装）
+        mgr = scheduler.register_layer(i, layer, name=f"{prefix}.{global_idx}")
+        layers.append(layer)
     modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)] + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"), f"{prefix}.{idx}")
-            for idx in range(start_layer, end_layer)
-        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+        [PPMissingLayer() for _ in range(start_layer)] + layers +
+        [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
+    )
+    # modules = torch.nn.ModuleList(
+    #     [PPMissingLayer() for _ in range(start_layer)] + [
+    #         maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"), f"{prefix}.{idx}")
+    #         for idx in range(start_layer, end_layer)
+    #     ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules
 
 def _initialize_model(

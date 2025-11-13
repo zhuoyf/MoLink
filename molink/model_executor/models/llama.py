@@ -54,6 +54,7 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer,
                     maybe_prefix)
 
 from .utils import make_layers
+from molink.worker.worker import molink_offload_scheduler
 
 import time
 
@@ -321,7 +322,7 @@ class LlamaModel(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        self.start_layer, self.end_layer, self.layers = molink_offload_scheduler.make_layers(
             config.num_hidden_layers,
             vllm_config,
             lambda prefix: layer_type(config=config,

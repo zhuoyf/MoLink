@@ -22,8 +22,10 @@ from vllm.worker.worker_base import WorkerInput, extract_previous_hidden_states
 from vllm.distributed import broadcast_tensor_dict
 from molink.distributed.parallel_state import ensure_model_parallel_initialized
 from molink.worker.model_runner import MolinkGPUModelRunner
+from molink.offloading.offload_scheduler import MolinkOffloadScheduler
 
-# zyflog：真实管理模型的类
+molink_offload_scheduler = None
+
 class MolinkWorker(Worker):
 
     def __init__(
@@ -53,6 +55,10 @@ class MolinkWorker(Worker):
             is_driver_worker=is_driver_worker,
             **speculative_args,
         )
+
+        global molink_offload_scheduler
+        molink_offload_scheduler = MolinkOffloadScheduler(vllm_config)
+        self.scheduler = molink_offload_scheduler
         
 
     def init_device(self, _is_first_rank: bool, _is_last_rank: bool,) -> None:
@@ -249,6 +255,7 @@ class MolinkWorker(Worker):
         kwargs = extract_previous_hidden_states(broadcast_data)
 
         return model_input, worker_input, kwargs, intermediate_tensors
+
 
 
 def init_worker_distributed_environment(

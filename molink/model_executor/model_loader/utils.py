@@ -6,6 +6,8 @@ from vllm.model_executor.models.adapters import (as_seq_cls_model,
                                                  as_reward_model)
 from molink.model_executor.models.registry import ModelRegistry
 
+
+
 def get_model_architecture(
         model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
     architectures = getattr(model_config.hf_config, "architectures", [])
