@@ -43,7 +43,6 @@ class MolinkGPUModelRunner(ModelRunner):
 
 
     def load_model(self) -> None:
-        #zyflog：真实加载模型函数
         logger.info("Starting to load model %s...", self.model_config.model)
         with DeviceMemoryProfiler() as m:
             self.model = get_model(vllm_config=self.vllm_config)
@@ -51,9 +50,6 @@ class MolinkGPUModelRunner(ModelRunner):
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
-
-        # TODO test
-        # self.offload_weight()
 
         if self.lora_config:
             assert supports_lora(
