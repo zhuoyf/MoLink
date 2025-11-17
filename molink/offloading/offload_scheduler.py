@@ -106,7 +106,7 @@ class MolinkLayerManager:
             self.cpu_weights[name] = cpu_data
 
             MolinkOffloadScheduler._CPU_OFFLOAD_BYTES += cpu_data.numel() * cpu_data.element_size()
-            # print(f"移动{MolinkOffloadScheduler._CPU_OFFLOAD_BYTES}字节到CPU,name:{name}")
+            print(f"移动{MolinkOffloadScheduler._CPU_OFFLOAD_BYTES}字节到CPU,name:{name}")
             offloaded_parameters = True
 
         if offloaded_parameters:
