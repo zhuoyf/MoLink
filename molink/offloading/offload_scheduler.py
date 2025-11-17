@@ -56,7 +56,8 @@ class MolinkOffloadScheduler:
             + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
         )
 
-        return start_layer, end_layer, modules
+        # MoLink: [start_layer, end_layer] --> vLLM: [start_layer, end_layer)
+        return start_layer, end_layer + 1, modules
 
 
 class MolinkLayerManager:
@@ -68,7 +69,7 @@ class MolinkLayerManager:
         self.module: Optional[nn.Module] = None
         self.is_on_gpu: bool = False
 
-        # 计时数据
+        # 计时数据: fwd_calls:前向传播次数；compute_time_ns_total:总共耗时；last_compute_time_ns:最后一次耗时
         self.fwd_calls: int = 0
         self.compute_time_ns_total: int = 0
         self.last_compute_time_ns: int = 0
@@ -117,12 +118,6 @@ class MolinkLayerManager:
 
                 mgr.check_layer()  # 在每次计算前调用 check_layer()，确保权重在GPU
 
-                # 复制整层 state_dict（参数+buffers）到 target_device（GPU）
-                # device_state = {
-                #     k: v.to(self.target_device, non_blocking=True)
-                #     for k, v in module.state_dict().items()
-                # }
-
                 # 记录计算耗时
                 t2 = time.perf_counter_ns()
 
@@ -135,15 +130,12 @@ class MolinkLayerManager:
                     mgr.compute_time_ns_total += mgr.last_compute_time_ns
                     mgr.fwd_calls += 1
                 finally:
-                    # 释放 GPU 端临时拷贝
                     mgr.device_state.clear()
                     del mgr.device_state  # 确保引用计数归零，进入 CUDA allocator 缓存
                     mgr.device_state = None
                     self.is_on_gpu = False
 
-                    # 恢复包装
                     module.forward = forward
-
 
                 return output
 
@@ -151,7 +143,9 @@ class MolinkLayerManager:
 
         return module
 
+
     def check_layer(self):
+        print(f"layer {self.index} checked!")
         if not self.is_on_gpu:
             self.device_state = self.materialize_to_gpu()
             self.is_on_gpu = True
@@ -162,10 +156,8 @@ class MolinkLayerManager:
         assert self.module is not None, "Layer module not initialized"
         assert self.target_device is not None, "Target device unknown"
 
-        # 直接基于 state_dict 逐项搬运（包括参数和 buffers）
         device_state: Dict[str, torch.Tensor] = {}
         for k, v in self.module.state_dict().items():
-            # 从 CPU 权重中复制
-            src = self.cpu_weights.get(k, v)  # 如果有 CPU 离线权重则从中取
+            src = self.cpu_weights.get(k, v)
             device_state[k] = src.to(self.target_device, non_blocking=True)
         return device_state

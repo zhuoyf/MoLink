@@ -67,8 +67,8 @@ class _MolinkEngine(_AsyncLLMEngine):
 
         self.profile_data = {'prefill' : {}, 'decode' : {}}
         first_layer, end_layer = U.get_pp_indices(1, 1, 1)
-        if first_layer == 0:
-            self.prerun_profile()
+        # if first_layer == 0:
+        #     self.prerun_profile()
 
     async def step_async(
         self, virtual_engine: int, ctx_idx: int
@@ -629,4 +629,5 @@ class MolinkEngine(AsyncLLMEngine):
             bubble = (base_batch_num) * single_transmission_latency
             if (batch_num - base_batch_num) * single_compute_latency >= bubble:
                 return batch_num 
+        print(f"here: self.engine.max_batch_num == {self.engine.max_batch_num}")
         return self.engine.max_batch_num
