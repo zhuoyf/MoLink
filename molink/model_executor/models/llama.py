@@ -366,7 +366,9 @@ class LlamaModel(nn.Module):
 
         aux_hidden_states = []
         # zyflog：这里对每一层进行推理
+        print(f"start:{self.start_layer}, end:{self.end_layer}", flush=True)
         for idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+            print(f"current layer: {idx}", flush=True)
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
                 

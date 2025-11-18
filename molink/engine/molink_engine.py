@@ -615,8 +615,15 @@ class MolinkEngine(AsyncLLMEngine):
         # equal to pipeline size
         base_batch_num = 2
         num_requests = len(self.engine.scheduler[0].waiting) + len(self.engine.scheduler[0].running)
+        if num_requests <= 1:
+            if num_requests == 1:
+                print("here return")
+            return 1
+        print(f"get num_requests {num_requests}")
         schedule_limit = int(num_requests / 2)
         self.engine.scheduler[0].set_schedule_limit(schedule_limit)
+
+
         
         return 2
 

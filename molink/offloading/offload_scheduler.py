@@ -145,7 +145,6 @@ class MolinkLayerManager:
 
 
     def check_layer(self):
-        print(f"layer {self.index} checked!")
         if not self.is_on_gpu:
             self.device_state = self.materialize_to_gpu()
             self.is_on_gpu = True
