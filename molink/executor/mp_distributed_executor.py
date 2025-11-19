@@ -129,7 +129,7 @@ class MultiprocessingDeliver(mp.Process):
                     None, 
                     self.process_queue.get
                 )
-                print(f"execute_model_req == {execute_model_req}", flush=True)
+                # print(f"execute_model_req == {execute_model_req}", flush=True)
                 # if "is_prompt=False" in str(execute_model_req):
                 #     print("hello")
 
