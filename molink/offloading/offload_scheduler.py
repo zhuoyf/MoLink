@@ -17,7 +17,7 @@ class MolinkOffloadScheduler:
     def __init__(self,
                  vllm_config: VllmConfig) -> None:
         MolinkOffloadScheduler._CPU_OFFLOAD_BYTES = 0
-        MolinkOffloadScheduler._CPU_OFFLOAD_MAX_BYTES = 0
+        MolinkOffloadScheduler._CPU_OFFLOAD_MAX_BYTES = 10
 
         self.vllm_config = vllm_config
         serving_layers = vllm_config.pipeline_config.serving_layers
@@ -26,7 +26,7 @@ class MolinkOffloadScheduler:
         self.num_layers = self.end_layer - self.start_layer + 1
         self.layer_managers: List[Optional[MolinkLayerManager]] = [None] * int(self.num_layers)
 
-        self.prefetch_distance: int = 3
+        self.prefetch_distance: int = 5
 
     def _prefetch_layer(self, global_idx: int) -> None:
         assert global_idx <= self.end_layer and global_idx >= self.start_layer, "Illegal prefetch index"
