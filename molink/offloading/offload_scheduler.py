@@ -8,7 +8,10 @@ from molink.config import MolinkConfig
 from vllm.model_executor.models.utils import LayerFn, PPMissingLayer
 from vllm.utils import is_pin_memory_available
 from vllm.config import VllmConfig
-
+from molink.offloading.TEE import TEESimulator
+import functools
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.activation import SiluAndMul
 
 class MolinkOffloadScheduler:
     _CPU_OFFLOAD_BYTES: int = 0
@@ -25,8 +28,10 @@ class MolinkOffloadScheduler:
         self.end_layer = serving_layers[1]
         self.num_layers = self.end_layer - self.start_layer + 1
         self.layer_managers: List[Optional[MolinkLayerManager]] = [None] * int(self.num_layers)
-
         self.prefetch_distance: int = 5
+
+        self.tee = TEESimulator(device=torch.device("cpu"))
+
 
     def _prefetch_layer(self, global_idx: int) -> None:
         assert global_idx <= self.end_layer and global_idx >= self.start_layer, "Illegal prefetch index"
@@ -38,6 +43,7 @@ class MolinkOffloadScheduler:
 
         mgr.device_state = mgr.materialize_to_gpu()
         mgr.is_on_gpu = True
+
 
     def _prefetch_initial_layers(self) -> None:
         # prefetch self.prefetch_distance layers to GPU
@@ -77,7 +83,7 @@ class MolinkOffloadScheduler:
         layers = []
         for idx in range(start_layer, end_layer + 1):
             rel = idx - start_layer
-            self.layer_managers[rel] = MolinkLayerManager(index=idx, scheduler=self)
+            self.layer_managers[rel] = MolinkLayerManager(index=idx, scheduler=self, tee=self.tee)
             layer_module = layer_fn(prefix=f"{prefix}.{idx}")
             layers.append(self.layer_managers[rel].maybe_offload_to_cpu(layer_module))
 
@@ -94,7 +100,7 @@ class MolinkOffloadScheduler:
 
 
 class MolinkLayerManager:
-    def __init__(self, index: int, scheduler: MolinkOffloadScheduler) -> None:
+    def __init__(self, index: int, scheduler: MolinkOffloadScheduler, tee: TEESimulator) -> None:
         self.index = index
         self.target_device: Optional[torch.device] = None
         self.cpu_weights: Dict[str, torch.Tensor] = {}
@@ -102,6 +108,8 @@ class MolinkLayerManager:
         self.module: Optional[nn.Module] = None
         self.is_on_gpu: bool = False
         self.scheduler = scheduler
+
+        self.tee = tee
 
         # todo 计时数据: fwd_calls:前向传播次数；compute_time_ns_total:总共耗时；last_compute_time_ns:最后一次耗时
         self.fwd_calls: int = 0
@@ -164,7 +172,7 @@ class MolinkLayerManager:
 
                 t2 = time.perf_counter_ns()
                 try:
-                    output = functional_call(module, mgr.device_state, args=args, kwargs=kwargs)
+                    output = mgr._forward_with_tee_nonlinear(module, mgr.device_state, *args, **kwargs)
 
                     t3 = time.perf_counter_ns()
                     mgr.last_compute_time_ns = t3 - t2
@@ -209,3 +217,51 @@ class MolinkLayerManager:
             src = self.cpu_weights.get(k, v)
             device_state[k] = src.to(self.target_device, non_blocking=True)
         return device_state
+
+
+    def _forward_with_tee_nonlinear(
+        self,
+        module: nn.Module,
+        params: Dict[str, torch.Tensor],
+        *args,
+        **kwargs,
+    ):
+        """
+        使用 functional_call 执行整个 layer 的前向，但在本次调用期间：
+          - 仅将 RMSNorm / SiluAndMul 的 forward 包一层 tee.run(...)
+          - 调用结束后恢复原 forward，不污染全局状态。
+        不改动 LlamaDecoderLayer 源码。
+        """
+
+        # return functional_call(module, params, args=args, kwargs=kwargs)
+
+        if self.tee is None:
+            # 没有 TEE，退回原逻辑
+            return functional_call(module, params, args=args, kwargs=kwargs)
+
+        nonlinear_types = (RMSNorm, SiluAndMul)
+
+        # 记录原始 forward，方便之后恢复
+        orig_forwards = []
+
+        for submodule in module.modules():
+            if isinstance(submodule, nonlinear_types):
+                orig = submodule.forward
+
+                @functools.wraps(orig)
+                def wrapped_forward(*a, _orig=orig, _tee=self.tee, **k):
+                    # 通过 TEE 统一执行这个非线性子模块
+                    return _tee.run(_orig, *a, **k)
+
+                orig_forwards.append((submodule, orig))
+                submodule.forward = wrapped_forward
+
+        try:
+            # 用给定的 params（在 GPU / CPU 上）执行整层前向
+            output = functional_call(module, params, args=args, kwargs=kwargs)
+        finally:
+            # 恢复所有非线性子模块的原始 forward，避免影响其它调用
+            for submodule, orig in orig_forwards:
+                submodule.forward = orig
+
+        return output
