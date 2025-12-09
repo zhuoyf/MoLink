@@ -3,7 +3,7 @@
 </div>
 
 ---
-The **OFFLOADING** implementation of [MoLink](github.com/oldcpple/MoLink)
+The **TEE** implementation of [MoLink](github.com/oldcpple/MoLink)
 ---
 
 # MoLink Project
