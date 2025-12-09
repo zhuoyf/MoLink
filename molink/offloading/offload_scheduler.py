@@ -228,40 +228,105 @@ class MolinkLayerManager:
     ):
         """
         使用 functional_call 执行整个 layer 的前向，但在本次调用期间：
-          - 仅将 RMSNorm / SiluAndMul 的 forward 包一层 tee.run(...)
-          - 调用结束后恢复原 forward，不污染全局状态。
-        不改动 LlamaDecoderLayer 源码。
+          - 对 SiluAndMul：调用原 forward，但在 TEE 中、CPU 设备上执行；
+          - 对 RMSNorm：绕过原 forward，使用我们手写的 CPU 实现，在 TEE 中执行；
+          - 调用结束后恢复所有子模块的 forward。
         """
 
-        # return functional_call(module, params, args=args, kwargs=kwargs)
-
+        # 如果没有 TEE，就直接走原逻辑
         if self.tee is None:
-            # 没有 TEE，退回原逻辑
             return functional_call(module, params, args=args, kwargs=kwargs)
 
         nonlinear_types = (RMSNorm, SiluAndMul)
-
-        # 记录原始 forward，方便之后恢复
         orig_forwards = []
 
         for submodule in module.modules():
-            if isinstance(submodule, nonlinear_types):
+            # ---------- 1. RMSNorm：走我们自己写的 CPU 实现 ----------
+            if isinstance(submodule, RMSNorm):
                 orig = submodule.forward
 
+                def rms_cpu_forward(*a, _mod=submodule):
+                    """
+                    纯 PyTorch 实现的 RMSNorm：
+                      - 支持两种调用：
+                          input_layernorm(x)
+                          input_layernorm(x, residual)
+                    """
+                    if len(a) == 1:
+                        x = a[0]
+                        residual = None
+                    elif len(a) == 2:
+                        x, residual = a
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected RMSNorm inputs len={len(a)}, expect 1 or 2."
+                        )
+
+                    eps = _mod.variance_epsilon
+                    weight = _mod.weight
+
+                    # 假设 x 已经在 CPU（TEE 会把参数搬过去）
+                    # 确保 weight 的 device / dtype 与 x 一致
+                    if torch.is_tensor(weight) and weight.device != x.device:
+                        w = weight.to(x.device)
+                    else:
+                        w = weight
+
+                    x2 = x.to(w.dtype)
+                    # RMSNorm: x / sqrt(mean(x^2) + eps) * weight
+                    var = x2.pow(2).mean(dim=-1, keepdim=True)
+                    rms = torch.sqrt(var + eps)
+                    y = x2 / rms * w
+
+                    if residual is None:
+                        return y
+                    else:
+                        return y, residual
+
                 @functools.wraps(orig)
-                def wrapped_forward(*a, _orig=orig, _tee=self.tee, **k):
-                    # 通过 TEE 统一执行这个非线性子模块
-                    return _tee.run(_orig, *a, **k)
+                def wrapped_forward(*a, _fn=rms_cpu_forward, _tee=self.tee, _layer=self.index, **k):
+                    # 注意：我们不再调用 orig，而是调用自定义 CPU 实现
+                    return _tee.run(
+                        _fn,
+                        *a,
+                        **k,
+                        __tee_layer=_layer,
+                        __tee_modname="RMSNorm",
+                    )
 
                 orig_forwards.append((submodule, orig))
                 submodule.forward = wrapped_forward
 
+            # ---------- 2. SiluAndMul：直接用原 forward，在 TEE + CPU 执行 ----------
+            elif isinstance(submodule, SiluAndMul):
+                @functools.wraps(submodule.forward)
+                def wrapped_forward(x, _tee=self.tee, _layer=self.index):
+                    return _tee.run(
+                        silu_and_mul_cpu, 
+                        x,
+                        __tee_layer=_layer,
+                        __tee_modname="SiluAndMul"
+                    )
+
+                orig_forwards.append((submodule, submodule.forward))
+                submodule.forward = wrapped_forward
+
         try:
-            # 用给定的 params（在 GPU / CPU 上）执行整层前向
+            # 🚀 真正执行这一层的前向（会触发我们上面的 wrapped_forward）
             output = functional_call(module, params, args=args, kwargs=kwargs)
         finally:
-            # 恢复所有非线性子模块的原始 forward，避免影响其它调用
+            # 恢复所有子模块的原始 forward
             for submodule, orig in orig_forwards:
                 submodule.forward = orig
 
         return output
+    
+def silu_and_mul_cpu(x: torch.Tensor) -> torch.Tensor:
+        # vLLM 的 MergedColumnParallelLinear 输出 layout 保持一致
+        # x shape: (B, 2*I)
+
+        # 按照最后一维一分为二
+        gate, up = x.chunk(2, dim=-1)
+
+        # SiluAndMul 正确定义： silu(gate) * up
+        return torch.nn.functional.silu(gate) * up
