@@ -41,6 +41,8 @@ class MolinkOffloadScheduler:
 
     def _prefetch_initial_layers(self) -> None:
         # prefetch self.prefetch_distance layers to GPU
+        if self.prefetch_distance == 0:
+            return
         max_idx = min(self.end_layer, self.start_layer + self.prefetch_distance - 1)
         for idx in range(self.start_layer, max_idx + 1):
             self._prefetch_layer(idx % self.num_layers)
