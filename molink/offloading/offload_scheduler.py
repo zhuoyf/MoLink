@@ -234,6 +234,7 @@ class MolinkLayerManager:
         """
 
         # 如果没有 TEE，就直接走原逻辑
+        return functional_call(module, params, args=args, kwargs=kwargs)
         if self.tee is None:
             return functional_call(module, params, args=args, kwargs=kwargs)
 
