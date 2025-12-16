@@ -94,6 +94,7 @@ class MolinkWorker(Worker):
 
         try:
             start_time = time.perf_counter()
+            torch.cuda.synchronize()
             inputs = self.prepare_input(execute_model_req)
             if inputs is None:
                 return None
@@ -129,7 +130,9 @@ class MolinkWorker(Worker):
                 **kwargs,
             )
 
+            torch.cuda.synchronize()
             model_execute_time = time.perf_counter() - start_time
+            print(f"0 calc {model_execute_time}")
             if not get_pp_group().is_last_rank:
                 # output is IntermediateTensors
                 assert isinstance(output, IntermediateTensors)

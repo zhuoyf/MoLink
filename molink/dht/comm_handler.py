@@ -16,6 +16,7 @@ from .dht import DHTNode
 from vllm.sequence import IntermediateTensors
 from molink.dht.proto import comm_pb2, comm_pb2_grpc
 import molink.distributed.parallel_state as P
+import time
 
 class CommService(comm_pb2_grpc.CommService):
 
@@ -81,6 +82,7 @@ class CommService(comm_pb2_grpc.CommService):
 
     async def PushSamplerOutput(self, result: comm_pb2.SamplerOutput, context: aio.ServicerContext):
         try:
+            print(f"0 get {time.time()}")
             virtual_engine = result.virtual_engine
             outputs = msgspec.json.decode(result.output_data)
             outputs = [decoding_sampler_outputs(outputs)]

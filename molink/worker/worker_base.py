@@ -4,6 +4,7 @@ from vllm.utils import (enable_trace_function_call_for_thread,
                         resolve_obj_by_qualname, update_environment_variables)
 from vllm.config import set_current_vllm_config
 from molink.worker.worker import MolinkWorker
+import time
 
 class MolinkWorkerWrapperBase(WorkerWrapperBase):
 

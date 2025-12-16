@@ -119,6 +119,8 @@ class MultiprocessingDeliver(mp.Process):
             )
             stub = comm_pb2_grpc.CommServiceStub(self.channel_to_next_server)
 
+            print(f"0 transmit {time.time()}")
+
             await stub.PushIntermediateTensors(grpc_request_data)
             
         except grpc.aio._call.AioRpcError as e:
@@ -159,6 +161,7 @@ class MultiprocessingDeliver(mp.Process):
                     
                     print('running a iteration', flush=True)
                     time.sleep(1)
+                    
 
                     try:
                         task = asyncio.create_task(

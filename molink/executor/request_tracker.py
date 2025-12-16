@@ -23,7 +23,7 @@ class RequestTracker:
         self.pipeline_data[virtual_engine]['virtual_engine'] = virtual_engine
 
         self.stack.append(virtual_engine)
-        print(f"count: microbatch: {virtual_engine}, request: {self.count_requests(execute_model_req)}")
+        # print(f"count: microbatch: {virtual_engine}, request: {self.count_requests(execute_model_req)}")
 
         if len(self.stack) > self.MAX_STACK_SIZE:
             self.stack = self.stack[-self.MAX_STACK_SIZE:]
