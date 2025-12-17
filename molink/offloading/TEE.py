@@ -1,99 +1,153 @@
-# TEE.py
 from __future__ import annotations
-
-import time
-from typing import Any, Callable, Dict
-
+import functools
+from typing import Optional, Union
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.func import functional_call
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.activation import SiluAndMul
 
 
 class TEESimulator:
-    def __init__(self, device: torch.device) -> None:
-        # TEE 计算所在 device（CPU）
-        self.device = device
+    def __init__(self):
+        self.cpu = torch.device("cpu")
 
-        self.total_calls: int = 0
-        self.total_time_ns: int = 0
-        self.last_call_time_ns: int = 0
-
-    def _move(self, obj: Any, device: torch.device) -> Any:
-        """递归把张量搬到指定 device。"""
-        if torch.is_tensor(obj):
-            return obj.to(device)
-        if isinstance(obj, (list, tuple)):
-            return type(obj)(self._move(x, device) for x in obj)
-        if isinstance(obj, dict):
-            return {k: self._move(v, device) for k, v in obj.items()}
-        return obj
-
-    def run(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
+    def forward_with_nonlinear(
+        self,
+        module: nn.Module,
+        params: dict,
+        *args,
+        layer_idx: int,
+        **kwargs,
+    ):
         """
-        在“TEE(=CPU)”中执行 fn(*args, **kwargs)：
-          - 将输入搬到 CPU；
-          - 调用 fn；
-          - 将输出搬回原 device；
-          - 打印进入/退出日志。
+        Run layer forward via functional_call(module, params, ...),
+        but override RMSNorm and SiluAndMul to execute on CPU (TEE).
         """
 
-        layer = kwargs.pop("__tee_layer", None)
-        modname = kwargs.pop("__tee_modname", None)
+        # without TEE
+        # return functional_call(module, params, args=args, kwargs=kwargs)
 
-        # 找出原始 device（任意一个 tensor 的 device）
-        original_device = None
-        for x in args:
-            if torch.is_tensor(x):
-                original_device = x.device
-                break
-        if original_device is None:
-            original_device = torch.device("cuda:0")
+        orig_forwards: list[tuple[nn.Module, callable]] = []
 
-        self.total_calls += 1
-        t0 = time.perf_counter_ns()
+        # ---- Patch submodule forwards ----
+        for submodule in module.modules():
+            # RMSNorm -> CPU implementation
+            if isinstance(submodule, RMSNorm):
+                orig = submodule.forward
 
-        # ---------- LOG: 进入 TEE ----------
-        # if layer is not None:
-            # print(f"[TEE] ENTER layer={layer}, module={modname}")
-            # for i, x in enumerate(args):
-                # if torch.is_tensor(x):
-                    # print(f"       input[{i}] shape={tuple(x.shape)} device={x.device}")
-        # -------------------------------
+                @functools.wraps(orig)
+                def wrapped_forward(x, residual=None, _mod=submodule):
+                    out_dev = x.device
 
-        # 搬到 CPU
-        args_cpu = self._move(args, self.device)
-        kwargs_cpu = self._move(kwargs, self.device)
+                    x_cpu = _to_cpu(x)
+                    residual_cpu = None if residual is None else _to_cpu(residual)
 
-        # 在 CPU 上执行
-        out_cpu = fn(*args_cpu, **kwargs_cpu)
+                    # IMPORTANT: use _mod.weight (NOT .data) to keep functional_call param substitution working
+                    if _mod.has_weight:
+                        w_cpu = _to_cpu(_mod.weight)
+                    else:
+                        w_cpu = torch.empty(0, device="cpu")
 
-        # 搬回原来的 device
-        out = self._move(out_cpu, original_device)
+                    y_cpu = rmsnorm_cpu_vllm(
+                        x_cpu=x_cpu,
+                        weight_cpu=w_cpu,
+                        eps=_mod.variance_epsilon,
+                        residual_cpu=residual_cpu,
+                        variance_size_override=_mod.variance_size_override,
+                        has_weight=_mod.has_weight,
+                    )
 
-        t1 = time.perf_counter_ns()
-        self.last_call_time_ns = t1 - t0
-        self.total_time_ns += self.last_call_time_ns
+                    if isinstance(y_cpu, tuple):
+                        return (_to_dev(y_cpu[0], out_dev), _to_dev(y_cpu[1], out_dev))
+                    return _to_dev(y_cpu, out_dev)
 
-        # ---------- LOG: 退出 TEE ----------
-        # if layer is not None:
-        #     print(f"[TEE] EXIT layer={layer}, module={modname}, time={self.last_call_time_ns/1e6:.3f} ms")
-        #     if torch.is_tensor(out):
-        #         print(f"       output shape={tuple(out.shape)} device={out.device}")
-        #     elif isinstance(out, tuple):
-        #         shapes = [tuple(t.shape) for t in out if torch.is_tensor(t)]
-        #         print(f"       output tuple shapes={shapes}")
-        # -------------------------------
+                orig_forwards.append((submodule, orig))
+                submodule.forward = wrapped_forward
 
-        return out
+            # SiluAndMul -> CPU implementation
+            elif isinstance(submodule, SiluAndMul):
+                orig = submodule.forward
 
-    def reset_stats(self) -> None:
-        self.total_calls = 0
-        self.total_time_ns = 0
-        self.last_call_time_ns = 0
+                @functools.wraps(orig)
+                def wrapped_forward(x, _mod=submodule):
+                    out_dev = x.device
+                    x_cpu = _to_cpu(x)
+                    y_cpu = silu_and_mul_cpu_stable(x_cpu)
+                    return _to_dev(y_cpu, out_dev)
 
-    def get_stats(self) -> Dict[str, Any]:
-        avg = self.total_time_ns / self.total_calls if self.total_calls > 0 else 0
-        return {
-            "total_calls": self.total_calls,
-            "total_time_ns": self.total_time_ns,
-            "last_call_time_ns": self.last_call_time_ns,
-            "avg_time_ns": avg,
-        }
+                orig_forwards.append((submodule, orig))
+                submodule.forward = wrapped_forward
+
+        try:
+            # 🚀 Actually run the layer forward
+            out = functional_call(module, params, args=args, kwargs=kwargs)
+            return out
+        finally:
+            # Restore original forwards (must always happen)
+            for sm, orig in orig_forwards:
+                sm.forward = orig
+
+
+def _to_cpu(t: torch.Tensor) -> torch.Tensor:
+    return t if t.device.type == "cpu" else t.to("cpu")
+
+
+def _to_dev(t: torch.Tensor, dev: torch.device) -> torch.Tensor:
+    return t if t.device == dev else t.to(dev)
+
+
+def silu_and_mul_cpu_stable(x_cpu: torch.Tensor) -> torch.Tensor:
+    """CPU SiLU(gate)*up, keep dtype stable."""
+    orig_dtype = x_cpu.dtype
+    gate, up = x_cpu.chunk(2, dim=-1)
+    y = F.silu(gate.float()) * up.float()
+    return y.to(orig_dtype)
+
+
+def rmsnorm_cpu_vllm(
+    x_cpu: torch.Tensor,
+    weight_cpu: torch.Tensor,
+    eps: float,
+    residual_cpu: Optional[torch.Tensor] = None,
+    variance_size_override: Optional[int] = None,
+    has_weight: bool = True,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Strictly match the semantics of vLLM RMSNorm.forward_native you posted:
+      - x -> float32
+      - if residual: x = x + residual(float32), residual_out = x(orig_dtype)
+      - variance on x or x[..., :override]
+      - x = x * rsqrt(var + eps)
+      - x -> orig_dtype
+      - if has_weight: x = x * weight
+      - return x or (x, residual_out)
+    """
+    orig_dtype = x_cpu.dtype
+    x = x_cpu.to(torch.float32)
+
+    if residual_cpu is not None:
+        x = x + residual_cpu.to(torch.float32)
+        residual_out = x.to(orig_dtype)
+    else:
+        residual_out = None
+
+    hidden_size = x.shape[-1]
+    if variance_size_override is None:
+        x_var = x
+    else:
+        if hidden_size < variance_size_override:
+            raise ValueError(
+                f"Expected hidden_size >= {variance_size_override}, but got {hidden_size}"
+            )
+        x_var = x[..., :variance_size_override]
+
+    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x.to(orig_dtype)
+
+    if has_weight:
+        x = x * weight_cpu
+
+    return x if residual_out is None else (x, residual_out)

@@ -30,7 +30,7 @@ class MolinkOffloadScheduler:
         self.layer_managers: List[Optional[MolinkLayerManager]] = [None] * int(self.num_layers)
         self.prefetch_distance: int = 5
 
-        self.tee = TEESimulator(device=torch.device("cpu"))
+        self.tee = TEESimulator()
 
 
     def _prefetch_layer(self, global_idx: int) -> None:
@@ -41,8 +41,7 @@ class MolinkOffloadScheduler:
         
         assert mgr is not None, f"Layer manager{rel} not been initialize"
 
-        mgr.device_state = mgr.materialize_to_gpu()
-        mgr.is_on_gpu = True
+        mgr.materialize_to_gpu()
 
 
     def _prefetch_initial_layers(self) -> None:
@@ -54,21 +53,12 @@ class MolinkOffloadScheduler:
             self._prefetch_layer(idx % self.num_layers)
 
     def layer_finished(self, idx: int) -> None:
-        # todo
         """
-        某一层 forward 完成后由 layer manager 调用。
-        调度策略：
-          - 当前层 index = i 完成后，尝试预取 i+3 层到 GPU。
+        某一层 forward 完成后的调度策略。
         """
         target_idx = idx + self.prefetch_distance
         self._prefetch_layer(target_idx % self.num_layers)
 
-    def materialize_layer_to_gpu(self, global_idx: int,
-                                 include_buffers: bool = True) -> Dict[str, torch.Tensor]:
-        rel = global_idx - self.start_layer
-        mgr = self.layer_managers[rel]
-        assert mgr is not None, f"Layer manager for index {global_idx} not registered"
-        return mgr.materialize_to_gpu()
 
     def make_layers(
         self,
@@ -92,7 +82,7 @@ class MolinkOffloadScheduler:
             + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
         )
 
-        # 初始化完成后，预取前三个层到 GPU
+        # 初始化完成后，预取层到 GPU
         self._prefetch_initial_layers()
 
         # MoLink: [start_layer, end_layer] --> vLLM: [start_layer, end_layer)
@@ -111,11 +101,6 @@ class MolinkLayerManager:
 
         self.tee = tee
 
-        # todo 计时数据: fwd_calls:前向传播次数；compute_time_ns_total:总共耗时；last_compute_time_ns:最后一次耗时
-        self.fwd_calls: int = 0
-        self.compute_time_ns_total: int = 0
-        self.last_compute_time_ns: int = 0
-
     def forward_finished(self) -> None:
         # report to scheduler
         self.scheduler.layer_finished(self.index)
@@ -128,20 +113,13 @@ class MolinkLayerManager:
         device = params.device
         self.target_device = device
 
-        if device == torch.device("cpu"):
-            for k, v in module.named_parameters():
-                if v.data.device.type == "cpu":
-                    self.cpu_weights[k] = v.data
-            return module
-
         # todo 调试if
         if MolinkOffloadScheduler._CPU_OFFLOAD_MAX_BYTES == 0:
             return module
 
         pin_memory = is_pin_memory_available()
         offloaded_parameters = False
-        # todo 调试变量
-        cnt = 0
+
         for name, p in module.named_parameters():
             cpu_data = torch.empty_strided(size=p.data.size(),
                                            stride=p.data.stride(),
@@ -157,8 +135,7 @@ class MolinkLayerManager:
             MolinkOffloadScheduler._CPU_OFFLOAD_BYTES += cpu_data.numel() * cpu_data.element_size()
             offloaded_parameters = True
 
-            cnt += cpu_data.numel() * cpu_data.element_size()
-        print(f"layer {self.index}({cnt / (1024**3)} GB) 成功移动到内存。")
+        print(f"layer {self.index} 成功移动到内存。")
 
         if offloaded_parameters:
             original_forward = module.forward
@@ -170,14 +147,10 @@ class MolinkLayerManager:
                 # make sure that layer in GPU
                 mgr.check_layer()
 
-                t2 = time.perf_counter_ns()
                 try:
-                    output = mgr._forward_with_tee_nonlinear(module, mgr.device_state, *args, **kwargs)
+                    # forward with TEE
+                    output = mgr.tee.forward_with_nonlinear(module, mgr.device_state, layer_idx=mgr.index, *args, **kwargs)
 
-                    t3 = time.perf_counter_ns()
-                    mgr.last_compute_time_ns = t3 - t2
-                    mgr.compute_time_ns_total += mgr.last_compute_time_ns
-                    mgr.fwd_calls += 1
                 finally:
                     if mgr.device_state is not None:
                         mgr.device_state.clear()
@@ -216,118 +189,6 @@ class MolinkLayerManager:
         for k, v in self.module.state_dict().items():
             src = self.cpu_weights.get(k, v)
             device_state[k] = src.to(self.target_device, non_blocking=True)
-        return device_state
-
-
-    def _forward_with_tee_nonlinear(
-        self,
-        module: nn.Module,
-        params: Dict[str, torch.Tensor],
-        *args,
-        **kwargs,
-    ):
-        """
-        使用 functional_call 执行整个 layer 的前向，但在本次调用期间：
-          - 对 SiluAndMul：调用原 forward，但在 TEE 中、CPU 设备上执行；
-          - 对 RMSNorm：绕过原 forward，使用我们手写的 CPU 实现，在 TEE 中执行；
-          - 调用结束后恢复所有子模块的 forward。
-        """
-
-        # 如果没有 TEE，就直接走原逻辑
-        return functional_call(module, params, args=args, kwargs=kwargs)
-        if self.tee is None:
-            return functional_call(module, params, args=args, kwargs=kwargs)
-
-        nonlinear_types = (RMSNorm, SiluAndMul)
-        orig_forwards = []
-
-        for submodule in module.modules():
-            # ---------- 1. RMSNorm：走我们自己写的 CPU 实现 ----------
-            if isinstance(submodule, RMSNorm):
-                orig = submodule.forward
-
-                def rms_cpu_forward(*a, _mod=submodule):
-                    """
-                    纯 PyTorch 实现的 RMSNorm：
-                      - 支持两种调用：
-                          input_layernorm(x)
-                          input_layernorm(x, residual)
-                    """
-                    if len(a) == 1:
-                        x = a[0]
-                        residual = None
-                    elif len(a) == 2:
-                        x, residual = a
-                    else:
-                        raise RuntimeError(
-                            f"Unexpected RMSNorm inputs len={len(a)}, expect 1 or 2."
-                        )
-
-                    eps = _mod.variance_epsilon
-                    weight = _mod.weight
-
-                    # 假设 x 已经在 CPU（TEE 会把参数搬过去）
-                    # 确保 weight 的 device / dtype 与 x 一致
-                    if torch.is_tensor(weight) and weight.device != x.device:
-                        w = weight.to(x.device)
-                    else:
-                        w = weight
-
-                    x2 = x.to(w.dtype)
-                    # RMSNorm: x / sqrt(mean(x^2) + eps) * weight
-                    var = x2.pow(2).mean(dim=-1, keepdim=True)
-                    rms = torch.sqrt(var + eps)
-                    y = x2 / rms * w
-
-                    if residual is None:
-                        return y
-                    else:
-                        return y, residual
-
-                @functools.wraps(orig)
-                def wrapped_forward(*a, _fn=rms_cpu_forward, _tee=self.tee, _layer=self.index, **k):
-                    # 注意：我们不再调用 orig，而是调用自定义 CPU 实现
-                    return _tee.run(
-                        _fn,
-                        *a,
-                        **k,
-                        __tee_layer=_layer,
-                        __tee_modname="RMSNorm",
-                    )
-
-                orig_forwards.append((submodule, orig))
-                submodule.forward = wrapped_forward
-
-            # ---------- 2. SiluAndMul：直接用原 forward，在 TEE + CPU 执行 ----------
-            elif isinstance(submodule, SiluAndMul):
-                @functools.wraps(submodule.forward)
-                def wrapped_forward(x, _tee=self.tee, _layer=self.index):
-                    return _tee.run(
-                        silu_and_mul_cpu, 
-                        x,
-                        __tee_layer=_layer,
-                        __tee_modname="SiluAndMul"
-                    )
-
-                orig_forwards.append((submodule, submodule.forward))
-                submodule.forward = wrapped_forward
-
-        try:
-            # 🚀 真正执行这一层的前向（会触发我们上面的 wrapped_forward）
-            output = functional_call(module, params, args=args, kwargs=kwargs)
-        finally:
-            # 恢复所有子模块的原始 forward
-            for submodule, orig in orig_forwards:
-                submodule.forward = orig
-
-        return output
-    
-def silu_and_mul_cpu(x: torch.Tensor) -> torch.Tensor:
-        # vLLM 的 MergedColumnParallelLinear 输出 layout 保持一致
-        # x shape: (B, 2*I)
-
-        # 按照最后一维一分为二
-        gate, up = x.chunk(2, dim=-1)
-
-        # SiluAndMul 正确定义： silu(gate) * up
-        return torch.nn.functional.silu(gate) * up
+        self.device_state = device_state
+        
+        return self.device_state
