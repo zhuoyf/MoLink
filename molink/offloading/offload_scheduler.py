@@ -41,19 +41,17 @@ class MolinkOffloadScheduler:
 
 
     def _prefetch_initial_layers(self) -> None:
-        # prefetch self.prefetch_distance layers to GPU
         if self.prefetch_distance == 0:
             return
+
         max_idx = min(self.end_layer, self.start_layer + self.prefetch_distance - 1)
         for idx in range(self.start_layer, max_idx + 1):
-            self._prefetch_layer(idx % self.num_layers)
+            self._prefetch_layer(idx)
 
     def layer_finished(self, idx: int) -> None:
-        """
-        某一层 forward 完成后的调度策略。
-        """
         target_idx = idx + self.prefetch_distance
-        self._prefetch_layer(target_idx % self.num_layers)
+        if target_idx <= self.end_layer:
+            self._prefetch_layer(target_idx)
 
 
     def make_layers(
