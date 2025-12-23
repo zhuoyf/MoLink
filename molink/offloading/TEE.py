@@ -50,7 +50,7 @@ class TEESimulator:
                     else:
                         w_cpu = torch.empty(0, device="cpu")
 
-                    y_cpu = rmsnorm_cpu_vllm(
+                    y_cpu = rmsnorm_cpu(
                         x_cpu=x_cpu,
                         weight_cpu=w_cpu,
                         eps=_mod.variance_epsilon,
@@ -74,7 +74,7 @@ class TEESimulator:
                 def wrapped_forward(x, _mod=submodule):
                     out_dev = x.device
                     x_cpu = _to_cpu(x)
-                    y_cpu = silu_and_mul_cpu_stable(x_cpu)
+                    y_cpu = silu_and_mul_cpu(x_cpu)
                     return _to_dev(y_cpu, out_dev)
 
                 orig_forwards.append((submodule, orig))
@@ -98,15 +98,41 @@ def _to_dev(t: torch.Tensor, dev: torch.device) -> torch.Tensor:
     return t if t.device == dev else t.to(dev)
 
 
-def silu_and_mul_cpu_stable(x_cpu: torch.Tensor) -> torch.Tensor:
-    """CPU SiLU(gate)*up, keep dtype stable."""
-    orig_dtype = x_cpu.dtype
-    gate, up = x_cpu.chunk(2, dim=-1)
-    y = F.silu(gate.float()) * up.float()
-    return y.to(orig_dtype)
+def silu_and_mul_cpu(x: torch.Tensor) -> torch.Tensor:
+    """
+    CPU implementation of SwiGLU: silu(x[..., :d]) * x[..., d:],
+    with numerically stable float32 compute and dtype preserved.
+
+    Args:
+        x: (..., 2 * d)
+
+    Returns:
+        (..., d)
+    """
+
+    print("in cpu silu and mul")
+
+    assert x.device.type == "cpu", "This function is CPU-only"
+    assert x.shape[-1] % 2 == 0, "Last dim must be even"
+
+    orig_dtype = x.dtype
+    d = x.shape[-1] // 2
+
+    # split
+    gate = x[..., :d]
+    up = x[..., d:]
+
+    # compute in float32 for stability
+    gate_f = gate.float()
+    up_f = up.float()
+
+    out = F.silu(gate_f) * up_f
+
+    # cast back
+    return out.to(orig_dtype)
 
 
-def rmsnorm_cpu_vllm(
+def rmsnorm_cpu(
     x_cpu: torch.Tensor,
     weight_cpu: torch.Tensor,
     eps: float,
@@ -124,6 +150,9 @@ def rmsnorm_cpu_vllm(
       - if has_weight: x = x * weight
       - return x or (x, residual_out)
     """
+
+    print("in cpu rmsnorm")
+
     orig_dtype = x_cpu.dtype
     x = x_cpu.to(torch.float32)
 
