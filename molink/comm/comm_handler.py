@@ -10,6 +10,7 @@ from .utils import decoding_execute_model_req, decoding_sampler_outputs
 from vllm.sequence import IntermediateTensors
 from molink.comm.proto import comm_pb2, comm_pb2_grpc
 import molink.distributed.parallel_state as P
+import time
 
 class CommService(comm_pb2_grpc.CommService):
 
@@ -37,6 +38,8 @@ class CommService(comm_pb2_grpc.CommService):
 
     async def PushIntermediateTensors(self, request: comm_pb2.GrpcRequestData, context: aio.ServicerContext):
         try:
+            with open('/root/env/server2.log', 'a') as f:
+                f.write(f"{request.virtual_engine} recv at {time.time()}\n")
             #event, request = await self._handler_event_queue.get()
             execute_model_req = request.execute_model_request
             intermediate_tensors = request.intermediate_tensors
@@ -62,6 +65,8 @@ class CommService(comm_pb2_grpc.CommService):
 
     async def PushSamplerOutput(self, result: comm_pb2.SamplerOutput, context: aio.ServicerContext):
         try:
+            with open('/root/env/server1.log', 'a') as f:
+                f.write(f"{result.virtual_engine} recv at {time.time()}\n")
             virtual_engine = result.virtual_engine
             outputs = msgspec.json.decode(result.output_data)
             outputs = [decoding_sampler_outputs(outputs)]
@@ -95,7 +100,23 @@ class CommService(comm_pb2_grpc.CommService):
                     self.bind_executor._start_worker_execution_loop())
 
             async with self.pp_lock:
+                tmp_str = str(execute_model_req)
+                sign = None
+                if 'is_prompt=False' in tmp_str:
+                    sign = 'decode'
+                else:
+                    sign = 'prefill'
+                batch_size = tmp_str.count("request_id=")
+                # print(f"{virtual_engine} {batch_size} compute starts ({sign}) at {time.time()}", flush=True)
+                with open('/root/env/server2.log', 'a') as f:
+                    f.write(f"{virtual_engine} {batch_size} compute starts ({sign}) at {time.time()}\n")
+
                 pipeline_outputs = await self.bind_executor.driver_exec_model(execute_model_req, intermediate_tensors)
+
+                torch.cuda.synchronize()
+                # print(f"{virtual_engine} compute ends at {time.time()}", flush=True)
+                with open('/root/env/server2.log', 'a') as f:
+                    f.write(f"{virtual_engine} compute ends at {time.time()}\n")
 
                 
             pipeline_outputs = pipeline_outputs[0]

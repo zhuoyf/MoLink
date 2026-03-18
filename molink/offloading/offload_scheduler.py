@@ -16,7 +16,7 @@ class MolinkOffloadScheduler:
     def __init__(self,
                  vllm_config: VllmConfig) -> None:
         MolinkOffloadScheduler._CPU_OFFLOAD_BYTES = 0
-        MolinkOffloadScheduler._CPU_OFFLOAD_MAX_BYTES = 10
+        MolinkOffloadScheduler._CPU_OFFLOAD_MAX_BYTES = 0
 
         self.vllm_config = vllm_config
         serving_layers = vllm_config.pipeline_config.serving_layers
@@ -24,7 +24,7 @@ class MolinkOffloadScheduler:
         self.end_layer = serving_layers[1]
         self.num_layers = self.end_layer - self.start_layer + 1
         self.layer_managers: List[Optional[MolinkLayerManager]] = [None] * int(self.num_layers)
-        self.prefetch_distance: int = 5
+        self.prefetch_distance: int = 16
 
         self.tee = TEESimulator()
 
@@ -38,6 +38,7 @@ class MolinkOffloadScheduler:
         assert mgr is not None, f"Layer manager{rel} not been initialize"
 
         mgr.materialize_to_gpu()
+        print(f"prefetch layer {rel}")
 
 
     def _prefetch_initial_layers(self) -> None:

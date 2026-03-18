@@ -27,7 +27,7 @@ class TEESimulator:
         """
 
         # without TEE
-        # return functional_call(module, params, args=args, kwargs=kwargs)
+        return functional_call(module, params, args=args, kwargs=kwargs)
 
         orig_forwards: list[tuple[nn.Module, callable]] = []
 
@@ -110,7 +110,7 @@ def silu_and_mul_cpu(x: torch.Tensor) -> torch.Tensor:
         (..., d)
     """
 
-    print("in cpu silu and mul")
+    # print("in cpu silu and mul")
 
     assert x.device.type == "cpu", "This function is CPU-only"
     assert x.shape[-1] % 2 == 0, "Last dim must be even"
@@ -151,7 +151,7 @@ def rmsnorm_cpu(
       - return x or (x, residual_out)
     """
 
-    print("in cpu rmsnorm")
+    # print("in cpu rmsnorm")
 
     orig_dtype = x_cpu.dtype
     x = x_cpu.to(torch.float32)

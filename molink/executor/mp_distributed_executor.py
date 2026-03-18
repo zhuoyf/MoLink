@@ -99,6 +99,10 @@ class MultiprocessingDeliver(mp.Process):
                 grpc_metadata=json.dumps(grpc_metadata).encode('utf-8'),
                 virtual_engine=virtual_engine
             )
+
+            with open('/root/env/server1.log', 'a') as f:
+                f.write(f"{virtual_engine} trans starts at {time.time()}\n")
+
             stub = comm_pb2_grpc.CommServiceStub(self.channel_to_next_server)
             await stub.PushIntermediateTensors(grpc_request_data)
             
@@ -110,11 +114,15 @@ class MultiprocessingDeliver(mp.Process):
             bytes_sampler_outputs = msgspec.json.encode(pipeline_outputs)
             return comm_pb2.SamplerOutput(output_data=bytes_sampler_outputs, virtual_engine = virtual_engine)
 
-    async def mp_async_return_results(self, grpc_sampler_outputs, head_server):
+    async def mp_async_return_results(self, grpc_sampler_outputs, head_server, virtual_engine):
         try:
             if self.preset_next_server != head_server:
                 self._establish_conn_with_next_server(head_server)
                 self.preset_next_server = head_server
+
+            with open('/root/env/server2.log', 'a') as f:
+                f.write(f"{virtual_engine} back to head at {time.time()}\n")
+
             stub = comm_pb2_grpc.CommServiceStub(self.channel_to_next_server)
             await stub.PushSamplerOutput(grpc_sampler_outputs)
 
@@ -144,7 +152,7 @@ class MultiprocessingDeliver(mp.Process):
                 elif push_type == 'head':
                     grpc_sampler_outputs = self.mp_serialize_sampler_outputs(intermediate_tensors_or_sampler_outputs, virtual_engine)
                     asyncio.create_task(
-                        self.mp_async_return_results(grpc_sampler_outputs, next_server)
+                        self.mp_async_return_results(grpc_sampler_outputs, next_server, virtual_engine)
                     )
 
         except Exception as e:
@@ -444,7 +452,22 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
             virtual_engine = execute_model_req.virtual_engine
 
             async with self.pp_lock:
+                tmp_str = str(execute_model_req)
+                sign = None
+                if 'is_prompt=False' in tmp_str:
+                    sign = 'decode'
+                else:
+                    sign = 'prefill'
+                batch_size = tmp_str.count("request_id=")
+                # print(f"{virtual_engine} {batch_size} compute starts ({sign}) at {time.time()}", flush=True)
+                with open('/root/env/server1.log', 'a') as f:
+                    f.write(f"{virtual_engine} {batch_size} compute starts ({sign}) at {time.time()}\n")
+
                 outputs = await self.driver_exec_model(execute_model_req)
+
+                torch.cuda.synchronize()
+                with open('/root/env/server1.log', 'a') as f:
+                    f.write(f"{virtual_engine} compute ends at {time.time()}\n")
             
             if not P.IN_AUTODL:
                 server_list = grpc_metadata.get('server_list', []) if grpc_metadata else []
