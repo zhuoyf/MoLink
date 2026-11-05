@@ -103,6 +103,7 @@ def start(args):
                  "q8": "MODEL_Q8"}[args.model])
     e = {"CUDA_VISIBLE_DEVICES": env("GPUS_A"), "RAY_AUTH_MODE": "disabled",
          "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+         "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": "HETVLLM_",
          "VLLM_PP_LAYER_PARTITION": args.partition,
          "HETVLLM_PP_TRACE": TRACE}
     if args.runner:
@@ -149,8 +150,8 @@ def start(args):
         if args.tpc_gate_ms:
             e["HETVLLM_TPC_GATE_MS"] = str(args.tpc_gate_ms)
     envs = " ".join(f"{k}={shlex.quote(v)}" for k, v in e.items())
-    sh(f"{envs} nohup {env('A_VENV')}/bin/python -m "
-       f"vllm.entrypoints.openai.api_server --model {model} "
+    sh(f"{envs} nohup {env('A_VENV')}/bin/vllm serve {model} "
+       f"--dtype bfloat16 "
        f"--served-model-name m --tensor-parallel-size {args.tp} "
        f"--pipeline-parallel-size {args.pp} --distributed-executor-backend ray "
        f"--port {os.environ.get('PORT', '26000')} "

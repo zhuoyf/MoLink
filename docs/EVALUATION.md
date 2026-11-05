@@ -1,5 +1,8 @@
 # MoLink v2 评测报告：两台机器、受限网络，跑同一个大模型，比原生 vLLM 快多少
 
+> 本报告的性能与精度数字基于 vLLM 0.23.0。当前 0.29.0 移植版的验证记录见
+> [UPGRADE-0.29.0.md](UPGRADE-0.29.0.md)。
+
 本文是 MoLink v2（代码内部名 hetvllm）的完整评测材料，可以独立阅读：结论、方法、技术细节。
 配套：[`../figs/`](../figs/)（图）、[`../data/`](../data/)（原始数据和汇总表）、
 [`../patch/`](../patch/)（对 vLLM 的补丁）、[`../kit/`](../kit/) 和
@@ -856,7 +859,7 @@ MoLink/（v2 分支根目录）
                        （fin6_o/fin6_n/fin6_n2 = A3B 我们/原生默认/原生 V2；d9_o/d9_n = 32B）
     round6/            12 项测试的原始回放（消融、PP4 p4_*/r7_o4f、Qwen3-8B q8_*、dip 扫描 dip_*）
   patch/
-    hetvllm-vllm-v0.23.0.patch   对上游 v0.23.0 的完整补丁
+    hetvllm-vllm-v0.29.0.patch   当前对上游 v0.29.0 的完整补丁
     DIFFSTAT.txt, README.md      逐文件说明和环境变量参考
   kit/
     cluster.env.example  集群描述（IP、网卡、GPU、venv；不含任何凭据）
