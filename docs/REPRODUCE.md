@@ -1,5 +1,9 @@
 # 复现指南
 
+当前安装基线为 vLLM **0.29.0**。下文的硬件表、性能数字和原生 V1/V2 对比来自
+0.23.0 历史评测；0.29.0 默认使用 V2，需重新测量性能，验证记录见
+[UPGRADE-0.29.0.md](UPGRADE-0.29.0.md)。
+
 一键配对测试（第 4 节）约需 **2 小时**（A3B：原生默认、原生 V2、我们各约 40 分钟；
 `NATIVE_V2=0` 跳过原生 V2 时约 80 分钟），不含模型冷加载。所有命令都在 A 机执行；B 机只需装好环境，由脚本经 ssh 远程驱动。
 
@@ -18,11 +22,16 @@
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git && cd vllm
-git checkout 0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665          # v0.23.0
-git apply /path/to/MoLink/patch/hetvllm-vllm-v0.23.0.patch
+git checkout 98dff2a81d747d1dba01a47f939f48c3526d4206          # v0.29.0
+git apply /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
 uv venv --python 3.12 && . .venv/bin/activate
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-uv pip install pyzmq aiohttp matplotlib
+# Pin the binary artifacts to the same release (x86_64, CUDA 12.9).
+WHEEL=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
+uv pip install "$WHEEL" --torch-backend=cu129
+VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
+    VLLM_PRECOMPILED_WHEEL_LOCATION="$WHEEL" \
+    uv pip install -e . --torch-backend=cu129
+uv pip install ray pyzmq aiohttp matplotlib
 ```
 
 模型：`Qwen/Qwen3-30B-A3B`（BF16）；可选 `Qwen/Qwen3-32B`（§6.1）、`Qwen/Qwen3-8B`（§6.3、§7.4）。**两台机器上的绝对路径必须相同**
@@ -54,8 +63,8 @@ python het.py stop && python het.py tc clear
 ```
 
 `$HET_RESULTS/engine.log` 里应能看到 `hetvllm exec config: runner=V2
-async_scheduling=True batch_queue_size=3 pp_size=2 tp_size=2`（`--best` 强制 Model Runner
-V2；原生 A3B 默认是 `runner=V1 ... batch_queue_size=2`）。
+async_scheduling=True batch_queue_size=3 pp_size=2 tp_size=2`（`--best` 显式选择 Model Runner V2；0.29.0 原生也默认使用 V2，
+`batch_queue_size` 以实际日志为准）。
 
 ## 4. 一键配对测试
 

@@ -6,10 +6,10 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
-[![vLLM 0.23.0](https://img.shields.io/badge/vLLM-0.23.0-green.svg)](https://github.com/vllm-project/vllm/tree/v0.23.0)
+[![vLLM 0.29.0](https://img.shields.io/badge/vLLM-0.29.0-green.svg)](https://github.com/vllm-project/vllm/tree/v0.29.0)
 
 **MoLink** serves one large LLM across machines that are far apart or poorly connected, and across GPUs of different classes.
-**MoLink v2** is a rewrite of that idea as a small, default-off patch on top of upstream vLLM v0.23.0,
+**MoLink v2** is a rewrite of that idea as a small, default-off patch on top of upstream vLLM v0.29.0,
 instead of the gRPC-based engine fork of v1. It targets one specific problem: with pipeline parallelism over a
 slow link (100 Mbps – 1 Gbps), the activation transfer between stages dominates every step, and the GPUs sit idle.
 
@@ -20,13 +20,16 @@ slow link (100 Mbps – 1 Gbps), the activation transfer between stages dominate
 | **`pp_link`** | Cross-machine PP transport over ZMQ instead of NCCL `isend/irecv`: 32 KiB framing, two priority classes (decode can overtake in-flight prefill bytes), per-direction ack-window backpressure, fully asynchronous send/receive. |
 | **int4 boundary encoding** | Stage-boundary activations are group-quantized to int4 (int8 also available). |
 | **Residual merging** | Only `s = h + r` crosses the link; the next stage recovers `RMSNorm(s)` exactly with a fused add+RMSNorm. Together with int4, cross-machine bytes drop to 0.14× of stock. |
-| **Model Runner V2** | Use upstream's V2 executor so decode no longer serializes across the two stages. |
-| **Control-plane trimming** (`--tok-tail`) | The scheduler stops re-sending full prompt+output token lists for requests not scheduled in the previous step. |
+| **Model Runner V2** | Upstream 0.29.0 enables V2 by default; `--best` selects it explicitly. |
+| **Control-plane trimming** (`--tok-tail`) | Upstream 0.29.0 already omits cached token lists for V2; the switch retains tail-only payloads for V1. |
 | **Predictive chunk scheduler** (optional, `--best-tpc`) | Fits step latency online and sizes prefill chunks to protect decode latency. |
 
-Every change is off unless a `HETVLLM_*` environment variable is set, so without them the patched tree behaves like upstream v0.23.0.
+Every change is off unless a `HETVLLM_*` environment variable is set, so without them the patched tree behaves like upstream v0.29.0.
 
 ## Results (headline)
+
+The results below were measured on vLLM **0.23.0**; the 0.29.0 port has separate
+[validation results](docs/UPGRADE-0.29.0.md).
 
 Testbed: A = 2×RTX 4090, B = 2×RTX 3090, link throttled with `tc`. Same machines, same split, same time window as the stock-vLLM baseline.
 
@@ -48,11 +51,16 @@ All numbers are from one cluster and one snapshot of the code; they do not trans
 ```bash
 # on BOTH machines
 git clone https://github.com/vllm-project/vllm.git && cd vllm
-git checkout 0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665          # v0.23.0
-git apply /path/to/MoLink/patch/hetvllm-vllm-v0.23.0.patch
+git checkout 98dff2a81d747d1dba01a47f939f48c3526d4206          # v0.29.0
+git apply /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
 uv venv --python 3.12 && . .venv/bin/activate
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-uv pip install pyzmq aiohttp matplotlib
+# Pin the binary artifacts to the same release (x86_64, CUDA 12.9).
+WHEEL=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
+uv pip install "$WHEEL" --torch-backend=cu129
+VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
+    VLLM_PRECOMPILED_WHEEL_LOCATION="$WHEEL" \
+    uv pip install -e . --torch-backend=cu129
+uv pip install ray pyzmq aiohttp matplotlib
 
 # on machine A: describe the cluster, then start the engine with the final configuration
 cd MoLink/kit && cp cluster.env.example cluster.env && $EDITOR cluster.env
@@ -70,7 +78,7 @@ bubble-rate and accuracy runs, expected results and tolerances) is in [docs/REPR
 README.md              this file
 docs/EVALUATION.md     full report: method, techniques, results, ablation, accuracy, limitations
 docs/REPRODUCE.md      install, configure, run, expected results
-patch/                 patch against vLLM v0.23.0 + per-file notes and env-var reference
+patch/                 patch against vLLM v0.29.0 + per-file notes and env-var reference
 kit/                   cluster launcher, benchmark/replay, ablation, bubble-rate and accuracy tools
 data/                  raw replay JSON and summary CSVs behind every number and figure
 figs/                  figures used in the report

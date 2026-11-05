@@ -1,35 +1,162 @@
+diff --git a/tests/v1/core/test_async_scheduler.py b/tests/v1/core/test_async_scheduler.py
+index 7f256f025e..1b7fc6bf35 100644
+--- a/tests/v1/core/test_async_scheduler.py
++++ b/tests/v1/core/test_async_scheduler.py
+@@ -314,6 +314,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
+     request.num_output_placeholders = 1
+ 
+     scheduler.perf_metrics = None
++    scheduler._tpc_pred = False
+     scheduler.connector = None
+     scheduler.ec_connector = None
+     scheduler.structured_output_manager = Mock()
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index c630abe4f3..8bc06552c0 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -237,12 +237,14 @@ def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
+     assert req.request_id in output.num_scheduled_tokens
+ 
+ 
+-def test_cached_request_data_resumed_all_token_ids_mrv1_only():
++@pytest.mark.parametrize("tok_tail", [False, True])
++def test_cached_request_data_resumed_all_token_ids_mrv1_only(monkeypatch, tok_tail):
+     """all_token_ids carries a resumed request's token ids to the connector
+     for the V1 model runner, but is skipped entirely for the V2 model runner.
+     """
+     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+ 
++    monkeypatch.setenv("HETVLLM_TOK_TAIL", "1" if tok_tail else "0")
+     scheduler = create_scheduler(use_v2_model_runner=False)
+     (req,) = create_requests(num_requests=1, num_tokens=8)
+     req.append_output_token_ids([101, 102, 103])
+@@ -265,7 +267,8 @@ def test_cached_request_data_resumed_all_token_ids_mrv1_only():
+     assert not scheduler.use_v2_model_runner
+     cached = make_cached()
+     assert req.request_id in cached.resumed_req_ids
+-    assert cached.all_token_ids[req.request_id] == list(req.all_token_ids)
++    expected = list(req.output_token_ids) if tok_tail else list(req.all_token_ids)
++    assert cached.all_token_ids[req.request_id] == expected
+ 
+     # V2 model runner: all_token_ids is skipped entirely.
+     scheduler.use_v2_model_runner = True
+@@ -274,6 +277,40 @@ def test_cached_request_data_resumed_all_token_ids_mrv1_only():
+     assert cached.all_token_ids == {}
+ 
+ 
++@pytest.mark.parametrize("mode", ["auto", "pred"])
++def test_het_chunk_budget_preserves_decode(monkeypatch, mode):
++    """A mixed step keeps decode work while capping the shared prefill budget."""
++    monkeypatch.setenv("HETVLLM_TPC", mode)
++    monkeypatch.setenv("HETVLLM_TPC_ROW_MS", "1")
++    monkeypatch.setenv("HETVLLM_TPC_DIP_MS", "32")
++    monkeypatch.setenv("HETVLLM_TPC_MIN_ROWS", "16")
++    scheduler = create_scheduler(max_num_batched_tokens=128)
++    (decode,) = create_requests(num_requests=1, num_tokens=8, req_ids=["decode"])
++    scheduler.add_request(decode)
++    output = scheduler.schedule()
++    scheduler.update_from_output(
++        output,
++        ModelRunnerOutput(
++            req_ids=["decode"],
++            req_id_to_index={"decode": 0},
++            sampled_token_ids=[[100]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    for req in create_requests(num_requests=2, num_tokens=96, req_ids=["p0", "p1"]):
++        scheduler.add_request(req)
++    output = scheduler.schedule()
++    assert output.num_scheduled_tokens["decode"] == 1
++    prefill_tokens = sum(
++        n for rid, n in output.num_scheduled_tokens.items() if rid != "decode"
++    )
++    assert 0 < prefill_tokens <= 32
++    assert output.total_num_scheduled_tokens <= 128
++    assert output.het_rows == output.total_num_scheduled_tokens
++
++
+ def test_schedule_partial_requests():
+     """Test scheduling behavior with partial requests.
+ 
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index 88cbee6802..7dc667717b 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -169,15 +169,21 @@ class _OrderedHandle:
+         self.log.append(f"wait:{self.name}")
+ 
+ 
++@pytest.mark.parametrize("use_link", [False, True])
+ def test_execute_model_waits_previous_pp_send_before_forward(
+     monkeypatch: pytest.MonkeyPatch,
++    use_link: bool,
+ ):
+     """Previous device handles are waited before the forward pass; the
+     metadata handle is left to the GroupCoordinator's reaper."""
+     import torch
+ 
++    from vllm.distributed import pp_link
+     from vllm.sequence import IntermediateTensors
+ 
++    monkeypatch.setattr(pp_link, "enabled", lambda: False)
++    monkeypatch.setattr(pp_link, "is_link_sender", lambda rank: use_link)
++
+     log: list[str] = []
+     previous_tensor_send = _OrderedHandle(log, "prev-tensor")
+     metadata_handle = _OrderedHandle(log, "meta")
+@@ -185,11 +191,12 @@ def test_execute_model_waits_previous_pp_send_before_forward(
+ 
+     def isend_tensor_dict(tensors, all_gather_group=None, all_gather_tensors=None):
+         log.append("isend")
+-        return [metadata_handle, tensor_handle]
++        return [tensor_handle] if use_link else [metadata_handle, tensor_handle]
+ 
+     pp_group = SimpleNamespace(
+         is_first_rank=True,
+         is_last_rank=False,
++        rank_in_group=0,
+         isend_tensor_dict=isend_tensor_dict,
+     )
+     monkeypatch.setattr(gpu_worker, "get_pp_group", lambda: pp_group)
 diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
-index 8bd6e92157..407f54ce81 100644
+index 0291a3d0ae..9eef83263e 100644
 --- a/vllm/distributed/parallel_state.py
 +++ b/vllm/distributed/parallel_state.py
-@@ -968,6 +968,10 @@ class GroupCoordinator:
-         all_gather_group: "GroupCoordinator | None" = None,
-         all_gather_tensors: dict[str, bool] | None = None,
-     ) -> list[Handle]:
+@@ -1143,6 +1143,12 @@ class GroupCoordinator:
+         ``wait()`` them as before; the retention entry is dropped on reap
+         either way.
+         """
 +        from vllm.distributed import pp_link
++
 +        if pp_link.is_link_sender(self.rank_in_group):
 +            from vllm.distributed.pp_link import get_link
++
 +            return get_link().send_tensor_dict(tensor_dict)  # type: ignore
          if self.world_size <= 1:
              return []
  
-@@ -1066,6 +1070,10 @@ class GroupCoordinator:
+@@ -1258,6 +1264,12 @@ class GroupCoordinator:
          list[Handle],
          list[Callable[[], None]],
      ]:
 +        from vllm.distributed import pp_link
++
 +        if pp_link.is_link_receiver(self.rank_in_group):
 +            from vllm.distributed.pp_link import get_link
++
 +            return get_link().recv_tensor_dict_async()  # type: ignore
          if not torch.distributed.is_initialized() or self.world_size == 1:
              return None, [], []
  
 diff --git a/vllm/distributed/pp_link.py b/vllm/distributed/pp_link.py
 new file mode 100644
-index 0000000000..c4dc903e74
+index 0000000000..75fa6d9a09
 --- /dev/null
 +++ b/vllm/distributed/pp_link.py
-@@ -0,0 +1,913 @@
+@@ -0,0 +1,959 @@
 +"""hetvllm-fork (pp2): link-scheduled PP transport for the cross-machine hop.
 +
 +Replaces the NCCL isend/irecv tensor-dict path between pipeline stages with
@@ -73,9 +200,10 @@ index 0000000000..c4dc903e74
 +import json
 +import os
 +import queue
-+from collections import deque
 +import threading
 +import time
++from collections import deque
++from contextlib import suppress
 +from dataclasses import dataclass, field
 +
 +import numpy as np
@@ -165,8 +293,11 @@ index 0000000000..c4dc903e74
 +
 +    def __init__(self, mode: str):
 +        self.mode = mode
-+        self.group = (int(os.environ.get("HETVLLM_PP_LINK_INT4_GROUP", "32")
-+                         or 32) if mode == "int4" else 64)
++        self.group = (
++            int(os.environ.get("HETVLLM_PP_LINK_INT4_GROUP", "32") or 32)
++            if mode == "int4"
++            else 64
++        )
 +
 +    def cpu_need(self, numel: int) -> int:
 +        if self.mode == "bf16":
@@ -189,23 +320,26 @@ index 0000000000..c4dc903e74
 +        N, H = t.shape
 +        if self.mode == "bf16":
 +            dst = scratch[: N * H * 2]
-+            dst.copy_(t.view(torch.uint8).reshape(-1),
-+                      non_blocking=True)
-+            return dst, {"codec": "bf16", "n": N, "h": H,
-+                         "nbytes": N * H * 2}
++            dst.copy_(t.view(torch.uint8).reshape(-1), non_blocking=True)
++            return dst, {"codec": "bf16", "n": N, "h": H, "nbytes": N * H * 2}
 +        g = self.group
 +        assert H % g == 0, H
 +        x = t.float().view(N, H // g, g)
 +        amax = x.abs().amax(dim=-1) + 1e-8
 +        if self.mode == "int4":
-+            scale = (amax / 7.0)
++            scale = amax / 7.0
 +            q = (x / scale.unsqueeze(-1)).clamp(-7, 7).to(torch.int32) & 0xF
 +            pairs = q.reshape(-1, 2)
 +            body = (pairs[:, 0] | (pairs[:, 1] << 4)).to(torch.uint8)
 +        else:
-+            scale = (amax / 127.0)
-+            body = (x / scale.unsqueeze(-1)).clamp(-127, 127).to(
-+                torch.int8).view(torch.uint8).reshape(-1)
++            scale = amax / 127.0
++            body = (
++                (x / scale.unsqueeze(-1))
++                .clamp(-127, 127)
++                .to(torch.int8)
++                .view(torch.uint8)
++                .reshape(-1)
++            )
 +        sc = scale.to(torch.float16).view(torch.uint8).reshape(-1)
 +        ns = sc.numel()
 +        dst = scratch[: ns + body.numel()]
@@ -214,8 +348,7 @@ index 0000000000..c4dc903e74
 +        else:
 +            dst[:ns].copy_(sc.cpu(), non_blocking=False)
 +            dst[ns:].copy_(body, non_blocking=True)
-+        return dst, {"codec": self.mode, "n": N, "h": H,
-+                     "nbytes": ns + body.numel()}
++        return dst, {"codec": self.mode, "n": N, "h": H, "nbytes": ns + body.numel()}
 +
 +    def decode_gpu(self, seg: torch.Tensor, tm: dict, device):
 +        """Wire image -> bf16 [N, H] on `device`.
@@ -227,10 +360,9 @@ index 0000000000..c4dc903e74
 +        """
 +        N, H = tm["n"], tm["h"]
 +        if tm["codec"] == "bf16":
-+            return seg.view(torch.bfloat16).view(N, H).to(
-+                device, non_blocking=True)
++            return seg.view(torch.bfloat16).view(N, H).to(device, non_blocking=True)
 +        g = self.group
-+        G = N * (H // g)                       # groups in the message
++        G = N * (H // g)  # groups in the message
 +        ns = G * 2
 +        dev = seg.to(device, non_blocking=True)
 +        scales = dev[:ns].view(torch.float16)  # [G]
@@ -241,12 +373,12 @@ index 0000000000..c4dc903e74
 +            g1 = min(G, g0 + _DEC_CHUNK)
 +            sc = scales[g0:g1].float().unsqueeze(-1)
 +            if int4:
-+                b = body[g0 * g // 2:g1 * g // 2].to(torch.int32)
++                b = body[g0 * g // 2 : g1 * g // 2].to(torch.int32)
 +                q = torch.stack((b & 0xF, b >> 4), dim=1).view(g1 - g0, g)
 +                q = torch.where(q >= 8, q - 16, q)
 +            else:
-+                q = body[g0 * g:g1 * g].view(torch.int8).view(g1 - g0, g)
-+            out[g0 * g:g1 * g] = (q.float() * sc).view(-1).to(torch.bfloat16)
++                q = body[g0 * g : g1 * g].view(torch.int8).view(g1 - g0, g)
++            out[g0 * g : g1 * g] = (q.float() * sc).view(-1).to(torch.bfloat16)
 +        return out.view(N, H)
 +
 +
@@ -260,13 +392,13 @@ index 0000000000..c4dc903e74
 +class _OutMsg:
 +    mid: int
 +    header: bytes
-+    payload: torch.Tensor          # flat uint8 (pinned scratch or cpu)
++    payload: torch.Tensor  # flat uint8 (pinned scratch or cpu)
 +    nbytes: int
 +    prio: int
 +    event: threading.Event = field(default_factory=threading.Event)
 +    # CUDA event after the D2H copies (async tx): the send thread waits on
 +    # it before the first payload byte goes out
-+    ready: "torch.cuda.Event | None" = None
++    ready: torch.cuda.Event | None = None
 +    # set once the last frame is handed to zmq
 +    queued: threading.Event = field(default_factory=threading.Event)
 +    bases: list = field(default_factory=list)  # pool buffers to return
@@ -320,7 +452,7 @@ index 0000000000..c4dc903e74
 +    order). Returned by recv_tensor_dict_async; consumed by the model
 +    forward via AsyncIntermediateTensors's handle wait."""
 +
-+    def __init__(self, link: "PPLink", sid: int):
++    def __init__(self, link: PPLink, sid: int):
 +        self.link = link
 +        self.sid = sid
 +        self.result: dict | None = None
@@ -345,7 +477,7 @@ index 0000000000..c4dc903e74
 +
 +    __slots__ = ("_fut", "_out")
 +
-+    def __init__(self, fut: "_RecvFuture", out: dict):
++    def __init__(self, fut: _RecvFuture, out: dict):
 +        self._fut = fut
 +        self._out = out
 +
@@ -354,7 +486,7 @@ index 0000000000..c4dc903e74
 +        if fut is None:
 +            return
 +        self._out.update(fut.wait())
-+        fut.result = None    # the dict above is now the only owner
++        fut.result = None  # the dict above is now the only owner
 +        self._fut = None
 +
 +
@@ -364,26 +496,33 @@ index 0000000000..c4dc903e74
 +        self.lane = None
 +        self.ctx = None
 +        self.sock: dict = {}
-+        self.send_q: "queue.Queue[_OutMsg | None]" = queue.Queue()
-+        self.ack_q: "queue.Queue[int]" = queue.Queue()
++        self.send_q: queue.Queue[_OutMsg | None] = queue.Queue()
++        self.ack_q: queue.Queue[int] = queue.Queue()
 +        self.pending: dict[int, _OutMsg] = {}
 +        self.plock = threading.Lock()
 +        self.unacked = 0
 +        self.msg_id = 0
-+        self.send_sid = 0          # step id of the next message to send
-+        self.recv_sid = 0          # step id the next recv call expects
++        self.send_sid = 0  # step id of the next message to send
++        self.recv_sid = 0  # step id the next recv call expects
 +        self.in_ready: dict[int, _InMsg] = {}
 +        self._requeue = deque()
-+        self.stats = {"sent_msg": 0, "sent_bytes": 0, "recv_msg": 0,
-+                      "recv_bytes": 0, "ack_wait_ms": 0.0, "net_wait_ms":
-+                      0.0, "hdr_wait_ms": 0.0, "pace_sleep_s": 0.0,
-+                      "win_wait_s": 0.0}
++        self.stats = {
++            "sent_msg": 0,
++            "sent_bytes": 0,
++            "recv_msg": 0,
++            "recv_bytes": 0,
++            "ack_wait_ms": 0.0,
++            "net_wait_ms": 0.0,
++            "hdr_wait_ms": 0.0,
++            "pace_sleep_s": 0.0,
++            "win_wait_s": 0.0,
++        }
 +        self._pool_out: list[torch.Tensor] = []
 +        self._pool_in: list[torch.Tensor] = []
-+        self._in_pend: deque = deque()   # (event, staging buf) in flight
-+        self._cap = 4 << 20                # staging buffer size (setup)
++        self._in_pend: deque = deque()  # (event, staging buf) in flight
++        self._cap = 4 << 20  # staging buffer size (setup)
 +        self._stash: dict[str, deque] = {}
-+        self._tok_acc = 0       # scheduled tokens seen (bytes/token audit)
++        self._tok_acc = 0  # scheduled tokens seen (bytes/token audit)
 +        self._last_dump = 0.0
 +
 +    # ------------------------------------------------------------- setup
@@ -396,10 +535,15 @@ index 0000000000..c4dc903e74
 +        # own link instance, both with lane=0 - offset the ports by the DP
 +        # rank so the two senders on machine A don't fight over one port.
 +        from vllm.distributed.parallel_state import get_dp_group
++
 +        self.dp = get_dp_group().rank_in_group
 +        p = _BASE_PORT + lane * 8 + self.dp * 16
-+        for name, port in (("fwd_hi", p), ("fwd_lo", p + 1),
-+                           ("bwd_hi", p + 2), ("bwd_lo", p + 3)):
++        for name, port in (
++            ("fwd_hi", p),
++            ("fwd_lo", p + 1),
++            ("bwd_hi", p + 2),
++            ("bwd_lo", p + 3),
++        ):
 +            s = self.ctx.socket(zmq.PAIR)
 +            s.setsockopt(zmq.SNDHWM, _HWM)
 +            s.setsockopt(zmq.RCVHWM, _HWM)
@@ -433,19 +577,15 @@ index 0000000000..c4dc903e74
 +            for name, s in socks.items():
 +                if name in done:
 +                    continue
-+                try:
++                with suppress(zmq.Again):
 +                    s.send(b"HS")
-+                except zmq.Again:
-+                    pass
 +                try:
 +                    m = s.recv()
 +                except zmq.Again:
 +                    continue
 +                if m == b"HS":
-+                    try:
++                    with suppress(zmq.Again):
 +                        s.send(b"HA")
-+                    except zmq.Again:
-+                        pass
 +                    done.add(name)
 +                elif m == b"HA":
 +                    done.add(name)
@@ -487,10 +627,12 @@ index 0000000000..c4dc903e74
 +            for i, t in enumerate(pool):
 +                if t.numel() >= need:
 +                    return pool.pop(i)
-+        logger.warning("pp_link: hot-path pinned alloc %d B (pool %s)",
-+                       need, "in" if pool is self._pool_in else "out")
-+        return torch.empty(max(need, self._cap), dtype=torch.uint8,
-+                           pin_memory=True)
++        logger.warning(
++            "pp_link: hot-path pinned alloc %d B (pool %s)",
++            need,
++            "in" if pool is self._pool_in else "out",
++        )
++        return torch.empty(max(need, self._cap), dtype=torch.uint8, pin_memory=True)
 +
 +    def _recycle_in(self):
 +        while self._in_pend and self._in_pend[0][0].query():
@@ -501,6 +643,7 @@ index 0000000000..c4dc903e74
 +        step budget, both tensors in bf16)."""
 +        try:
 +            from vllm.config import get_current_vllm_config
++
 +            cfg = get_current_vllm_config()
 +            rows = cfg.scheduler_config.max_num_batched_tokens
 +            hid = cfg.model_config.get_hidden_size()
@@ -513,15 +656,14 @@ index 0000000000..c4dc903e74
 +        sender = self.stage == _FROM_STAGE
 +        pool = self._pool_out if sender else self._pool_in
 +        for _ in range(_POOL_N * (2 if sender else 1)):
-+            pool.append(torch.empty(self._cap, dtype=torch.uint8,
-+                                    pin_memory=True))
++            pool.append(torch.empty(self._cap, dtype=torch.uint8, pin_memory=True))
 +
 +    def send_tensor_dict(self, tensor_dict: dict) -> list[MsgHandle]:
 +        from vllm.distributed.parallel_state import get_tp_group
++
 +        tp = get_tp_group().world_size
 +        merged = False
-+        if _MERGE and "hidden_states" in tensor_dict and \
-+                "residual" in tensor_dict:
++        if _MERGE and "hidden_states" in tensor_dict and "residual" in tensor_dict:
 +            # plan.md round 3: the next layer consumes s = h + r only via
 +            # fused add+RMSNorm (norm out, s as the new residual), so the
 +            # pair carries no independent information - ship s once.
@@ -531,21 +673,23 @@ index 0000000000..c4dc903e74
 +            h = tensor_dict["hidden_states"]
 +            r = tensor_dict["residual"]
 +            tensor_dict = dict(tensor_dict)
-+            tensor_dict["hidden_states"] = (
-+                h.float() + r.float()).to(torch.bfloat16)
++            tensor_dict["hidden_states"] = (h.float() + r.float()).to(torch.bfloat16)
 +            del tensor_dict["residual"]
 +            merged = True
 +        self._tok_acc += _STEP_HINT[0]
 +        parts = []
-+        bases = []   # whole pool buffers behind the segment views
++        bases = []  # whole pool buffers behind the segment views
 +        metas = []
 +        total = 0
 +        for k, v in tensor_dict.items():
 +            if not isinstance(v, torch.Tensor):
 +                metas.append({"key": k, "codec": "obj", "nbytes": 0})
 +                continue
-+            assert v.is_cuda and v.dim() == 2 and \
-+                v.dtype == torch.bfloat16, (k, v.shape, v.dtype)
++            assert v.is_cuda and v.dim() == 2 and v.dtype == torch.bfloat16, (
++                k,
++                v.shape,
++                v.dtype,
++            )
 +            # match the native all-gather optimization: each TP lane sends
 +            # only its slice of the flattened tensor (half the link bytes)
 +            flat = v.reshape(-1)
@@ -556,9 +700,15 @@ index 0000000000..c4dc903e74
 +            bases.append(base)
 +            seg, meta = _CODEC_OBJ.encode(flat.view(1, -1), base)
 +            parts.append(seg)
-+            metas.append(meta | {"key": k, "fn": v.shape[0],
-+                                 "fh": v.shape[1], "sl": flat.numel() !=
-+                                 v.numel()})
++            metas.append(
++                meta
++                | {
++                    "key": k,
++                    "fn": v.shape[0],
++                    "fh": v.shape[1],
++                    "sl": flat.numel() != v.numel(),
++                }
++            )
 +            total += meta["nbytes"]
 +        ready = None
 +        if _ASYNC_TX:
@@ -567,12 +717,24 @@ index 0000000000..c4dc903e74
 +        else:
 +            torch.cuda.current_stream().synchronize()
 +        mid = self.msg_id
-+        hdr = {"id": mid, "sid": self.send_sid, "prio": self._prio(total),
-+               "nbytes": total, "tensors": metas,
-+               "mg": 1 if merged else 0, "tok": _STEP_HINT[0]}
-+        msg = _OutMsg(mid, json.dumps(hdr).encode(),
-+                      parts if parts else torch.empty(0, dtype=torch.uint8),
-+                      total, hdr["prio"], ready=ready, bases=bases)
++        hdr = {
++            "id": mid,
++            "sid": self.send_sid,
++            "prio": self._prio(total),
++            "nbytes": total,
++            "tensors": metas,
++            "mg": 1 if merged else 0,
++            "tok": _STEP_HINT[0],
++        }
++        msg = _OutMsg(
++            mid,
++            json.dumps(hdr).encode(),
++            parts if parts else torch.empty(0, dtype=torch.uint8),
++            total,
++            hdr["prio"],
++            ready=ready,
++            bases=bases,
++        )
 +        with self.plock:
 +            self.pending[mid] = msg
 +            self.msg_id += 1
@@ -619,18 +781,20 @@ index 0000000000..c4dc903e74
 +            nb = tm["nbytes"]
 +            if nb == 0:
 +                continue
-+            seg = buf[off:off + nb]
++            seg = buf[off : off + nb]
 +            t = _CODEC_OBJ.decode_gpu(
-+                seg, tm, torch.device("cuda", torch.cuda.current_device()))
++                seg, tm, torch.device("cuda", torch.cuda.current_device())
++            )
 +            if tm.get("sl"):
 +                from vllm.distributed.parallel_state import get_tp_group
++
 +                tpg = get_tp_group()
 +                # reassemble the full tensor across the intra-machine TP
 +                # group (same trick the native path uses, NCCL over PCIe)
-+                full = torch.empty(
-+                    tm["fn"] * tm["fh"], dtype=t.dtype, device=t.device)
++                full = torch.empty(tm["fn"] * tm["fh"], dtype=t.dtype, device=t.device)
 +                torch.distributed.all_gather_into_tensor(
-+                    full, t.reshape(-1), group=tpg.device_group)
++                    full, t.reshape(-1), group=tpg.device_group
++                )
 +                t = full.view(tm["fn"], tm["fh"])
 +            else:
 +                t = t.view(tm["fn"], tm["fh"])
@@ -642,8 +806,7 @@ index 0000000000..c4dc903e74
 +            # exactly the pre-merge semantics, zero extra wire bytes.
 +            out["residual"] = torch.zeros_like(out["hidden_states"])
 +        self._tok_acc += int(m.header.get("tok", 0))
-+        base = m.base if m.base is not None and m.base.numel() >= (4 << 20) \
-+            else None
++        base = m.base if m.base is not None and m.base.numel() >= (4 << 20) else None
 +        if not _ASYNC_TX:
 +            torch.cuda.synchronize()
 +            if base is not None:
@@ -674,10 +837,18 @@ index 0000000000..c4dc903e74
 +            if getattr(self, "dp", 0):
 +                suffix += f"d{self.dp}"
 +            with open(f"{_STATS_PATH}{suffix}", "a") as f:
-+                f.write(json.dumps({
-+                    "t": round(now, 3), "stage": self.stage,
-+                    "lane": self.lane, "tok": self._tok_acc,
-+                    **self.stats}) + "\n")
++                f.write(
++                    json.dumps(
++                        {
++                            "t": round(now, 3),
++                            "stage": self.stage,
++                            "lane": self.lane,
++                            "tok": self._tok_acc,
++                            **self.stats,
++                        }
++                    )
++                    + "\n"
++                )
 +        except OSError:
 +            pass
 +
@@ -726,8 +897,7 @@ index 0000000000..c4dc903e74
 +            # enqueued message never blocks its own start.
 +            for prio in (0, 1):
 +                st = active[prio]
-+                if st is not None and st[3] == 0 and _WIN > 0 and \
-+                        self.unacked > _WIN:
++                if st is not None and st[3] == 0 and _WIN > 0 and self.unacked > _WIN:
 +                    t0 = time.time()
 +                    while self.unacked > _WIN:
 +                        self._drain_acks(0.0)
@@ -746,8 +916,7 @@ index 0000000000..c4dc903e74
 +            msg, si, so, off = st
 +            n = msg.nbytes
 +            if off == 0:
-+                self._dir_sock(msg.prio, forward=True).send(
-+                    msg.header, zmq.SNDMORE)
++                self._dir_sock(msg.prio, forward=True).send(msg.header, zmq.SNDMORE)
 +            now = time.perf_counter()
 +            if _RATE > 0:
 +                bucket = min(bucket + (now - last) * _RATE, _RATE)
@@ -766,7 +935,8 @@ index 0000000000..c4dc903e74
 +                with self.plock:
 +                    self.unacked += n
 +            self._dir_sock(msg.prio, forward=True).send(
-+                frame, 0 if st[3] >= n else zmq.SNDMORE)
++                frame, 0 if st[3] >= n else zmq.SNDMORE
++            )
 +            if st[3] >= n:
 +                msg.queued.set()
 +                self.stats["sent_msg"] += 1
@@ -802,8 +972,11 @@ index 0000000000..c4dc903e74
 +        poller = zmq.Poller()
 +        # the hop's receiver (stage _FROM_STAGE + 1) polls the forward
 +        # sockets; the sender polls the backward ones (acks)
-+        mine = ("fwd_hi", "fwd_lo") if self.stage == _FROM_STAGE + 1 \
++        mine = (
++            ("fwd_hi", "fwd_lo")
++            if self.stage == _FROM_STAGE + 1
 +            else ("bwd_hi", "bwd_lo")
++        )
 +        for name in mine:
 +            poller.register(self.sock[name], zmq.POLLIN)
 +        while True:
@@ -842,10 +1015,8 @@ index 0000000000..c4dc903e74
 +        hdr = next_frame()
 +        if hdr in (b"HS", b"HA"):
 +            if hdr == b"HS":
-+                try:
++                with suppress(zmq.Again):
 +                    s.send(b"HA")
-+                except zmq.Again:
-+                    pass
 +            return
 +        try:
 +            h = json.loads(hdr)
@@ -863,21 +1034,22 @@ index 0000000000..c4dc903e74
 +            got = next_frame(copy=False)
 +            take = min(len(got), remaining)
 +            # one memcpy straight into the pinned staging buffer
-+            dst[off:off + take] = np.frombuffer(got, dtype=np.uint8,
-+                                                count=take)
++            dst[off : off + take] = np.frombuffer(got, dtype=np.uint8, count=take)
 +            off += take
 +            remaining -= take
 +        m.base = buf
-+        m.buf = buf[:m.nbytes] if buf is not None else \
-+            torch.empty(0, dtype=torch.uint8)
++        m.buf = (
++            buf[: m.nbytes] if buf is not None else torch.empty(0, dtype=torch.uint8)
++        )
 +        m.t_ready = time.time()
 +        m.event.set()
 +        self.in_ready[h["sid"]] = m
 +        self.stats["recv_msg"] += 1
 +        self.stats["recv_bytes"] += m.nbytes
 +        self._stats_dump()
-+        self._dir_sock(0, forward=not (self.stage == _FROM_STAGE + 1)).send(
-+            json.dumps({"ack": str(h["id"])}).encode())
++        self._dir_sock(0, forward=self.stage != _FROM_STAGE + 1).send(
++            json.dumps({"ack": str(h["id"])}).encode()
++        )
 +
 +    def _complete_ack(self, mid: int):
 +        """Ack handling happens on the recv thread: complete the pending
@@ -894,8 +1066,7 @@ index 0000000000..c4dc903e74
 +        if frames ever land here."""
 +        while True:
 +            try:
-+                mid = self.ack_q.get(
-+                    timeout=timeout if timeout > 0 else 0.0)
++                mid = self.ack_q.get(timeout=timeout if timeout > 0 else 0.0)
 +            except queue.Empty:
 +                return
 +            self._complete_ack(mid)
@@ -935,19 +1106,21 @@ index 0000000000..c4dc903e74
 +            if not (_BIND_IP and _PEER_IP):
 +                raise RuntimeError(
 +                    "HETVLLM_PP_LINK=1 needs HETVLLM_PP_LINK_BIND (stage-0 "
-+                    "host IP) and HETVLLM_PP_LINK_PEER (stage-1 host IP)")
-+            from vllm.distributed.parallel_state import (
-+                get_pp_group, get_tp_group)
++                    "host IP) and HETVLLM_PP_LINK_PEER (stage-1 host IP)"
++                )
++            from vllm.distributed.parallel_state import get_pp_group, get_tp_group
++
 +            lnk = PPLink()
-+            lnk.setup(stage=get_pp_group().rank_in_group,
-+                      lane=get_tp_group().rank_in_group)
++            lnk.setup(
++                stage=get_pp_group().rank_in_group, lane=get_tp_group().rank_in_group
++            )
 +            _LINK = lnk
 +        return _LINK
 diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
-index ed85323d80..19d20d3a2a 100644
+index 2fa01478ce..a4b80012ec 100644
 --- a/vllm/entrypoints/openai/completion/serving.py
 +++ b/vllm/entrypoints/openai/completion/serving.py
-@@ -261,6 +261,8 @@ class OpenAIServingCompletion(OpenAIServing):
+@@ -263,6 +263,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
                  request_metadata,
              )
          except asyncio.CancelledError:
@@ -956,7 +1129,7 @@ index ed85323d80..19d20d3a2a 100644
              return self.create_error_response("Client disconnected")
  
          # When user requests streaming but we don't stream, we still need to
-@@ -471,8 +473,22 @@ class OpenAIServingCompletion(OpenAIServing):
+@@ -498,8 +500,22 @@ class OpenAIServingCompletion(GenerateBaseServing):
              logger.exception("Error in completion stream generator.")
              data = self.create_streaming_error_response(e)
              yield f"data: {data}\n\n"
@@ -1342,13 +1515,13 @@ index 0000000000..ac24c24c5e
 +}
 \ No newline at end of file
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index b2e9dd8b17..205f2d92ea 100644
+index c9d969cd34..5fa5204cf4 100644
 --- a/vllm/v1/core/sched/output.py
 +++ b/vllm/v1/core/sched/output.py
-@@ -240,6 +240,19 @@ class SchedulerOutput:
-     # preventing stale NaN/data from corrupting attention or SSM computation.
-     new_block_ids_to_zero: list[int] | None = None
- 
+@@ -294,6 +294,18 @@ class SchedulerOutput:
+     # Dynamic speculative decoding: optimal K chosen by scheduler.
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
 +    # hetvllm-fork (pp2, TP-C): this step is a "hi" micro-batch - decode rows
 +    # (plus small prompt-completion chunks) only, no mid-prompt prefill rows.
 +    # The inter-stage transport sends hi steps at high priority so their rows
@@ -1361,15 +1534,14 @@ index b2e9dd8b17..205f2d92ea 100644
 +    # model.
 +    het_t_sched: float = 0.0
 +    het_rows: int = 0
-+
+ 
      @classmethod
      def make_empty(cls) -> "SchedulerOutput":
-         return cls(
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 889232c3e4..e75bca9d82 100644
+index 83ed59799e..67619ca8a6 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -1,6 +1,8 @@
+@@ -1,9 +1,12 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  import itertools
@@ -1378,7 +1550,11 @@ index 889232c3e4..e75bca9d82 100644
  import time
  from collections import defaultdict, deque
  from collections.abc import Iterable
-@@ -107,6 +109,125 @@ class Scheduler(SchedulerInterface):
++from contextlib import suppress
+ from dataclasses import replace
+ from typing import Any
+ 
+@@ -123,6 +126,115 @@ class Scheduler(SchedulerInterface):
              if self.scheduler_config.max_num_scheduled_tokens is not None
              else self.scheduler_config.max_num_batched_tokens
          )
@@ -1403,8 +1579,7 @@ index 889232c3e4..e75bca9d82 100644
 +        _bw = float(os.environ.get("HETVLLM_NET_BW_MBPS", "0") or 0)
 +        _bpt = float(os.environ.get("HETVLLM_NET_BYTES_PER_TOK", "8192"))
 +        _tgt = float(os.environ.get("HETVLLM_NET_TGT_MS", "150"))
-+        self._pp_net_chunk = int(_bw * 1e6 * (_tgt / 1000.0) / _bpt) \
-+            if _bw > 0 else 0
++        self._pp_net_chunk = int(_bw * 1e6 * (_tgt / 1000.0) / _bpt) if _bw > 0 else 0
 +        self._pp_net_chunk_env = self._pp_net_chunk  # ctrl-file reload base
 +        # pp2 TP-C: micro-batch scheduling over the shared weak link.
 +        # Two modes (runtime-switchable via the ctrl file's "mode" key):
@@ -1422,23 +1597,17 @@ index 889232c3e4..e75bca9d82 100644
 +        self._tpc = os.environ.get("HETVLLM_TPC", "0") in ("auto", "pred")
 +        self._tpc_auto = os.environ.get("HETVLLM_TPC", "0") == "auto"
 +        self._tpc_pred = os.environ.get("HETVLLM_TPC", "0") == "pred"
-+        self._tpc_split = (
-+            os.environ.get("HETVLLM_TPC_SPLIT", "1") != "0")
-+        self._tpc_gate_ms = float(
-+            os.environ.get("HETVLLM_TPC_GATE_MS", "95") or 95)
-+        self._tpc_hi_t_ms = float(
-+            os.environ.get("HETVLLM_TPC_HI_T_MS", "-60") or -60)
-+        self._tpc_alpha = float(
-+            os.environ.get("HETVLLM_TPC_ALPHA", "0.6") or 0.6)
++        self._tpc_split = os.environ.get("HETVLLM_TPC_SPLIT", "1") != "0"
++        self._tpc_gate_ms = float(os.environ.get("HETVLLM_TPC_GATE_MS", "95") or 95)
++        self._tpc_hi_t_ms = float(os.environ.get("HETVLLM_TPC_HI_T_MS", "-60") or -60)
++        self._tpc_alpha = float(os.environ.get("HETVLLM_TPC_ALPHA", "0.6") or 0.6)
 +        # hard per-step row cap: one step may not grow beyond what a single
 +        # ITL dip of ~dip_ms can absorb - budget sizing works within this
 +        # guard, it cannot override it (a huge step would commit every
 +        # decoding request to a long ITL spike before the scheduler can
 +        # react again).
-+        self._tpc_dip_ms = float(
-+            os.environ.get("HETVLLM_TPC_DIP_MS", "180") or 180)
-+        self._tpc_min_rows = int(
-+            os.environ.get("HETVLLM_TPC_MIN_ROWS", "64") or 64)
++        self._tpc_dip_ms = float(os.environ.get("HETVLLM_TPC_DIP_MS", "180") or 180)
++        self._tpc_min_rows = int(os.environ.get("HETVLLM_TPC_MIN_ROWS", "64") or 64)
 +        _row = os.environ.get("HETVLLM_TPC_ROW_MS", "")
 +        _arow = float(os.environ.get("HETVLLM_TPC_AROW_MS", "0.34") or 0.34)
 +        _brow = float(os.environ.get("HETVLLM_TPC_BROW_MS", "0.11") or 0.11)
@@ -1447,21 +1616,18 @@ index 889232c3e4..e75bca9d82 100644
 +        elif _bw > 0:
 +            # per-row step latency: max(A exec, wire) + B exec - the A-side
 +            # long-context compute is usually the serializer, not the wire
-+            self._tpc_row_ms = max(
-+                _arow, _bpt / (_bw * 1e6) * 1000.0) + _brow
++            self._tpc_row_ms = max(_arow, _bpt / (_bw * 1e6) * 1000.0) + _brow
 +        else:
 +            self._tpc_row_ms = _arow + _brow
 +        self._tpc_hi_rows = int(os.environ.get("HETVLLM_TPC_HI_ROWS", "256"))
 +        # v2-only: emergent decode cadence in mixed steps (steps a decode
 +        # token waits for its sampled-token feedback, ~2 with this scheduler)
-+        self._tpc_spt = float(
-+            os.environ.get("HETVLLM_TPC_STEPS_PER_TOK", "2") or 2)
++        self._tpc_spt = float(os.environ.get("HETVLLM_TPC_STEPS_PER_TOK", "2") or 2)
 +        # pp2 TP-C fastlane: small prompts (<= hi_rows tokens) may be
 +        # admitted during hi heartbeat steps and jump the waiting-queue
 +        # head - short requests otherwise queue behind 8K group prefills
 +        # and miss their (much tighter) TTFT gate.
-+        self._tpc_fastlane = (
-+            os.environ.get("HETVLLM_TPC_FASTLANE", "1") != "0")
++        self._tpc_fastlane = os.environ.get("HETVLLM_TPC_FASTLANE", "1") != "0"
 +        # v3 pred: online pipeline completion-time model. rt(rows) is the
 +        # schedule->sampled-feedback latency of a batch with `rows` total
 +        # scheduled tokens, fitted by decaying 2x1 least squares (slope =
@@ -1476,21 +1642,22 @@ index 889232c3e4..e75bca9d82 100644
 +        self._rt_sxy = 0.0
 +        self._rt_slope = 2.2 * self._tpc_row_ms
 +        self._rt_base = 10.0
-+        self._rt_err = 15.0        # EWMA |pred - measured| (ms) -> eps
-+        self._tpc_eps_ms = float(
-+            os.environ.get("HETVLLM_TPC_EPS_MS", "0") or 0)
++        self._rt_err = 15.0  # EWMA |pred - measured| (ms) -> eps
++        self._tpc_eps_ms = float(os.environ.get("HETVLLM_TPC_EPS_MS", "0") or 0)
 +        self._tpc_pending_lo = False
 +        # monotonic timestamp when prefill work first waited behind
 +        # decode-only steps (lo-starvation guard for the hi pairing)
 +        self._tpc_lo_wait_t: float | None = None
 +        self._tpc_lo_starve_ms = float(
-+            os.environ.get("HETVLLM_TPC_LO_STARVE_MS", "400") or 400)
++            os.environ.get("HETVLLM_TPC_LO_STARVE_MS", "400") or 400
++        )
 +        _pp_dir = os.environ.get("HETVLLM_PP_TRACE")
 +        if _pp_dir:
 +            try:
 +                os.makedirs(_pp_dir, exist_ok=True)
-+                self._pp_trace_f = open(
-+                    os.path.join(_pp_dir, "sched.jsonl"), "a", buffering=1)
++                self._pp_trace_f = open(  # noqa: SIM115
++                    os.path.join(_pp_dir, "sched.jsonl"), "a", buffering=1
++                )
 +            except OSError:
 +                self._pp_trace_f = None
 +        if self._het_ctrl_path:
@@ -1498,16 +1665,15 @@ index 889232c3e4..e75bca9d82 100644
 +                with open(self._het_ctrl_path, "a"):  # touch
 +                    pass
 +            except OSError:
-+                logger.warning("hetvllm: cannot open ctrl file %s",
-+                               self._het_ctrl_path)
++                logger.warning("hetvllm: cannot open ctrl file %s", self._het_ctrl_path)
 +                self._het_ctrl_path = None
          self.max_model_len = vllm_config.model_config.max_model_len
          self.enable_kv_cache_events = (
              self.kv_events_config is not None
-@@ -358,6 +479,135 @@ class Scheduler(SchedulerInterface):
-         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
-         num_scheduled_tokens: dict[str, int] = {}
-         token_budget = self.max_num_scheduled_tokens
+@@ -522,6 +634,143 @@ class Scheduler(SchedulerInterface):
+         spec = self.vllm_config.speculative_config
+         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+         input_budget = self.scheduler_config.max_num_batched_tokens
 +        if self._het_ctrl_path is not None:
 +            self._het_reload_ctrl()
 +        # hetvllm-fork (pp2, technical point 4): net-aware chunk sizing.
@@ -1517,15 +1683,16 @@ index 889232c3e4..e75bca9d82 100644
 +        # Without decodes the cap is lifted (full chunks for throughput).
 +        if self._pp_net_chunk > 0 and self.running and not self._tpc_pred:
 +            n_dec = sum(
-+                1 for r in self.running
-+                if r.num_tokens_with_spec - r.num_computed_tokens <= 1)
++                1
++                for r in self.running
++                if r.num_tokens_with_spec - r.num_computed_tokens <= 1
++            )
 +            if n_dec:
 +                # deepen the allowed chunk as the prefill backlog grows:
 +                # steady state keeps the small-chunk ITL bound, overload
 +                # trades ITL for drain speed instead of collapsing
 +                depth = 1 + min(4, len(self.waiting) // 8)
-+                token_budget = min(token_budget,
-+                                   n_dec + self._pp_net_chunk * depth)
++                token_budget = min(token_budget, n_dec + self._pp_net_chunk * depth)
 +        # pp2 TP-C: pick this step's micro-batch class. "hi" = decode rows +
 +        # small completions, "lo" = mid-prompt chunks. Alternation keeps the
 +        # decode cadence at one cycle (hi+lo) while lo chunks stream at the
@@ -1533,14 +1700,20 @@ index 889232c3e4..e75bca9d82 100644
 +        tpc_cls = None
 +        tpc_chunk_left: int | None = None
 +        if self._tpc:
++
 +            def _rem(r: Request) -> int:
-+                return (r.num_tokens_with_spec + r.num_output_placeholders
-+                        - r.num_computed_tokens)
++                return (
++                    r.num_tokens_with_spec
++                    + r.num_output_placeholders
++                    - r.num_computed_tokens
++                )
++
 +            n_dec = sum(1 for r in self.running if _rem(r) == 1)
 +            if self._tpc_pred:
 +                # v3: deadline + measured-RTT driven. All times in ms.
 +                has_lo_work = bool(self.waiting) or any(
-+                    _rem(r) > 1 for r in self.running)
++                    _rem(r) > 1 for r in self.running
++                )
 +                now = time.monotonic()
 +                raw_min: float | None = None
 +                eff_min: float | None = None
@@ -1550,8 +1723,7 @@ index 889232c3e4..e75bca9d82 100644
 +                    d0 = getattr(r, "_het_dec0", None)
 +                    if d0 is None:
 +                        continue
-+                    s = (self._tpc_gate_ms * r.num_output_tokens
-+                         - (now - d0) * 1000.0)
++                    s = self._tpc_gate_ms * r.num_output_tokens - (now - d0) * 1000.0
 +                    fut = max(0, (r.max_tokens or 0) - r.num_output_tokens)
 +                    e = s + self._tpc_alpha * fut * self._tpc_gate_ms
 +                    raw_min = s if raw_min is None else min(raw_min, s)
@@ -1576,8 +1748,8 @@ index 889232c3e4..e75bca9d82 100644
 +                    # credit (TPOT is an average gate).
 +                    urgent = (
 +                        raw_min is not None
-+                        and (raw_min + self._tpc_gate_ms
-+                             - rt_d - eps) <= 0)
++                        and (raw_min + self._tpc_gate_ms - rt_d - eps) <= 0
++                    )
 +                    # lo-starvation guard: pair a chunk after the hi only
 +                    # when lo work has actually been waiting - otherwise
 +                    # decode runs stay unbroken (short hi steps in a row),
@@ -1585,7 +1757,8 @@ index 889232c3e4..e75bca9d82 100644
 +                    starved = (
 +                        self._tpc_lo_wait_t is not None
 +                        and (now - self._tpc_lo_wait_t) * 1000.0
-+                        > self._tpc_lo_starve_ms)
++                        > self._tpc_lo_starve_ms
++                    )
 +                    if urgent and self._tpc_split:
 +                        tpc_cls = "hi"
 +                        if starved:
@@ -1609,7 +1782,8 @@ index 889232c3e4..e75bca9d82 100644
 +                # decode phase; the raw-slack heartbeat only fires once a
 +                # request actually dips below zero budget.
 +                has_lo_work = bool(self.waiting) or any(
-+                    _rem(r) > 1 for r in self.running)
++                    _rem(r) > 1 for r in self.running
++                )
 +                now = time.monotonic()
 +                raw: list[float] = []
 +                eff: list[float] = []
@@ -1619,31 +1793,31 @@ index 889232c3e4..e75bca9d82 100644
 +                    d0 = getattr(r, "_het_dec0", None)
 +                    if d0 is None:
 +                        continue
-+                    s = (self._tpc_gate_ms * r.num_output_tokens
-+                         - (now - d0) * 1000.0)
++                    s = self._tpc_gate_ms * r.num_output_tokens - (now - d0) * 1000.0
 +                    raw.append(s)
 +                    fut = max(0, (r.max_tokens or 0) - r.num_output_tokens)
-+                    eff.append(s + self._tpc_alpha * fut
-+                               * self._tpc_gate_ms)
++                    eff.append(s + self._tpc_alpha * fut * self._tpc_gate_ms)
 +                if raw:
 +                    if min(raw) <= self._tpc_hi_t_ms:
 +                        tpc_cls = "hi"
 +                    elif has_lo_work:
 +                        credit_cap = int(
 +                            (min(eff) - self._tpc_hi_t_ms)
-+                            / (self._tpc_spt * self._tpc_row_ms))
++                            / (self._tpc_spt * self._tpc_row_ms)
++                        )
 +                        hard_cap = max(
-+                            self._tpc_min_rows,
-+                            int(self._tpc_dip_ms / self._tpc_row_ms))
++                            self._tpc_min_rows, int(self._tpc_dip_ms / self._tpc_row_ms)
++                        )
 +                        tpc_chunk_left = max(
-+                            self._tpc_min_rows, min(credit_cap, hard_cap))
++                            self._tpc_min_rows, min(credit_cap, hard_cap)
++                        )
          if self._pause_state == PauseState.PAUSED_ALL:
              # Do not schedule any requests when paused.
              token_budget = 0
-@@ -415,6 +665,34 @@ class Scheduler(SchedulerInterface):
-                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-             )
- 
+@@ -607,6 +856,32 @@ class Scheduler(SchedulerInterface):
+                 num_new_tokens = self._mamba_block_aligned_split(
+                     request, num_new_tokens
+                 )
 +            # pp2 TP-C auto: budgeted chunk - prefill rows this step are
 +            # capped by the tightest decode budget (decodes ride along).
 +            if tpc_chunk_left is not None and num_new_tokens > 1:
@@ -1656,8 +1830,7 @@ index 889232c3e4..e75bca9d82 100644
 +            if tpc_cls is not None:
 +                completing = (
 +                    request.num_computed_tokens + num_new_tokens
-+                    >= request.num_tokens_with_spec
-+                    + request.num_output_placeholders
++                    >= request.num_tokens_with_spec + request.num_output_placeholders
 +                )
 +                if tpc_cls == "hi":
 +                    if num_new_tokens > 1 and not (
@@ -1671,20 +1844,19 @@ index 889232c3e4..e75bca9d82 100644
 +                    ):
 +                        req_index += 1
 +                        continue
-+
+ 
              # Schedule encoder inputs.
              encoder_inputs_to_schedule = None
-             external_load_encoder_input: list[int] = []
-@@ -514,6 +792,8 @@ class Scheduler(SchedulerInterface):
-             req_to_new_blocks[request_id] = new_blocks
+@@ -726,6 +1001,8 @@ class Scheduler(SchedulerInterface):
              num_scheduled_tokens[request_id] = num_new_tokens
              token_budget -= num_new_tokens
+             input_budget -= num_new_tokens + draft_slots
 +            if tpc_chunk_left is not None and num_new_tokens > 1:
 +                tpc_chunk_left -= num_new_tokens
              req_index += 1
  
              # Speculative decode related.
-@@ -560,7 +840,13 @@ class Scheduler(SchedulerInterface):
+@@ -772,7 +1049,16 @@ class Scheduler(SchedulerInterface):
              assert len(scheduled_loras) <= self.lora_config.max_loras
  
          # Next, schedule the WAITING requests.
@@ -1694,12 +1866,15 @@ index 889232c3e4..e75bca9d82 100644
 +        # Fastlane exception: small prompts (<= hi_rows) may ride a hi
 +        # step so short requests don't queue behind 8K group prefills.
 +        fastlane = self._tpc and self._tpc_fastlane
-+        if (not preempted_reqs and self._pause_state == PauseState.UNPAUSED
-+                and (tpc_cls != "hi" or fastlane)):
++        if (
++            not preempted_reqs
++            and self._pause_state == PauseState.UNPAUSED
++            and (tpc_cls != "hi" or fastlane)
++        ):
              step_skipped_waiting = create_request_queue(self.policy)
  
              while (self.waiting or self.skipped_waiting) and token_budget > 0:
-@@ -571,6 +857,25 @@ class Scheduler(SchedulerInterface):
+@@ -788,6 +1074,27 @@ class Scheduler(SchedulerInterface):
                  assert request_queue is not None
  
                  request = request_queue.peek_request()
@@ -1708,16 +1883,18 @@ index 889232c3e4..e75bca9d82 100644
 +                # admitted; any step bumps one small request ahead of a
 +                # long queue head (SJF for the tight short-class TTFT).
 +                if fastlane:
-+                    if (tpc_cls == "hi"
-+                            and request.num_tokens > self._tpc_hi_rows):
++                    if tpc_cls == "hi" and request.num_tokens > self._tpc_hi_rows:
 +                        break
 +                    if request.num_tokens > self._tpc_hi_rows:
 +                        small = next(
-+                            (r for r in request_queue
-+                             if r.num_tokens <= self._tpc_hi_rows
-+                             and not self._is_blocked_waiting_status(
-+                                 r.status)),
-+                            None)
++                            (
++                                r
++                                for r in request_queue
++                                if r.num_tokens <= self._tpc_hi_rows
++                                and not self._is_blocked_waiting_status(r.status)
++                            ),
++                            None,
++                        )
 +                        if small is not None:
 +                            request_queue.remove_request(small)
 +                            request_queue.prepend_request(small)
@@ -1725,9 +1902,9 @@ index 889232c3e4..e75bca9d82 100644
                  request_id = request.request_id
  
                  # try to promote blocked statuses while traversing skipped queue.
-@@ -698,6 +1003,12 @@ class Scheduler(SchedulerInterface):
+@@ -997,6 +1304,12 @@ class Scheduler(SchedulerInterface):
  
-                     num_new_tokens = min(num_new_tokens, token_budget)
+                     num_new_tokens = min(num_new_tokens, request_token_budget)
                      assert num_new_tokens > 0
 +                    # pp2 TP-C auto: new admissions share the same chunk
 +                    # budget as running prefills this step.
@@ -1736,28 +1913,28 @@ index 889232c3e4..e75bca9d82 100644
 +                            break
 +                        num_new_tokens = min(num_new_tokens, tpc_chunk_left)
  
-                     # Schedule encoder inputs.
-                     if request.has_encoder_inputs:
-@@ -842,6 +1153,8 @@ class Scheduler(SchedulerInterface):
-                 )
+                     # Apply Mamba alignment before encoder caps.
+                     if self.need_mamba_block_aligned_split:
+@@ -1179,6 +1492,8 @@ class Scheduler(SchedulerInterface):
                  num_scheduled_tokens[request_id] = num_new_tokens
                  token_budget -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
 +                if tpc_chunk_left is not None:
 +                    tpc_chunk_left -= num_new_tokens
                  request.status = RequestStatus.RUNNING
                  request.num_computed_tokens = num_computed_tokens
-                 # Only track requests that will still be prefilling after this chunk.
-@@ -945,6 +1258,9 @@ class Scheduler(SchedulerInterface):
-             finished_req_ids=self.finished_req_ids,
-             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-             new_block_ids_to_zero=new_block_ids_to_zero,
+                 if pad_spec_decode:
+@@ -1354,6 +1669,9 @@ class Scheduler(SchedulerInterface):
+             kv_connector_block_state=kv_connector_block_state,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
 +            pp_hi=(tpc_cls == "hi"),
 +            het_t_sched=time.monotonic(),
 +            het_rows=total_num_scheduled_tokens,
          )
  
          # NOTE(Kuntai): this function is designed for multiple purposes:
-@@ -964,8 +1280,130 @@ class Scheduler(SchedulerInterface):
+@@ -1381,8 +1699,135 @@ class Scheduler(SchedulerInterface):
  
          with record_function_or_nullcontext("schedule: update_after_schedule"):
              self._update_after_schedule(scheduler_output)
@@ -1767,29 +1944,32 @@ index 889232c3e4..e75bca9d82 100644
 +                rec = {
 +                    "t": round(time.time(), 4),
 +                    "step": self.current_step,
-+                    "sched_ms": round((time.monotonic() - scheduled_timestamp)
-+                                      * 1000.0, 3),
++                    "sched_ms": round(
++                        (time.monotonic() - scheduled_timestamp) * 1000.0, 3
++                    ),
 +                    "wait": len(self.waiting)
-+                            + len(getattr(self, "skipped_waiting", ())),
++                    + len(getattr(self, "skipped_waiting", ())),
 +                    "run": len(self.running),
 +                    "reqs": len(num_scheduled_tokens),
 +                    "total_tok": total_num_scheduled_tokens,
 +                    "new": len(scheduled_new_reqs),
 +                    "preempt": len(preempted_reqs),
-+                    "kv_free": self.kv_cache_manager.block_pool
-+                                      .get_num_free_blocks(),
++                    "kv_free": self.kv_cache_manager.block_pool.get_num_free_blocks(),
 +                    "budget": self.max_num_scheduled_tokens,
 +                }
 +                if self._tpc:
-+                    rec |= {"cls": tpc_cls,
-+                            "d": n_dec if self._tpc else 0,
-+                            "split": self._tpc_pending_lo}
++                    rec |= {
++                        "cls": tpc_cls,
++                        "d": n_dec if self._tpc else 0,
++                        "split": self._tpc_pending_lo,
++                    }
 +                if self._tpc_pred:
-+                    rec |= {"rt_slope": round(self._rt_slope, 4),
-+                            "rt_base": round(self._rt_base, 2),
-+                            "eps": round(self._tpc_eps(), 1)}
-+                self._pp_trace_f.write(
-+                    json.dumps(rec, separators=(",", ":")) + "\n")
++                    rec |= {
++                        "rt_slope": round(self._rt_slope, 4),
++                        "rt_base": round(self._rt_base, 2),
++                        "eps": round(self._tpc_eps(), 1),
++                    }
++                self._pp_trace_f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 +            except Exception:  # noqa: BLE001
 +                pass
          return scheduler_output
@@ -1810,10 +1990,8 @@ index 889232c3e4..e75bca9d82 100644
 +        self._rt_sxy = lam * self._rt_sxy + rows * rt_ms
 +        det = self._rt_sxx * self._rt_neff - self._rt_sx * self._rt_sx
 +        if det > 1e-3 and self._rt_neff > 6.0:
-+            slope = (self._rt_neff * self._rt_sxy
-+                     - self._rt_sx * self._rt_sy) / det
-+            base = (self._rt_sxx * self._rt_sy
-+                    - self._rt_sx * self._rt_sxy) / det
++            slope = (self._rt_neff * self._rt_sxy - self._rt_sx * self._rt_sy) / det
++            base = (self._rt_sxx * self._rt_sy - self._rt_sx * self._rt_sxy) / det
 +            if 0.02 <= slope <= 20.0 and -50.0 <= base <= 500.0:
 +                self._rt_slope, self._rt_base = slope, base
 +        err = abs(self._rt_predict(rows) - rt_ms)
@@ -1827,7 +2005,9 @@ index 889232c3e4..e75bca9d82 100644
 +        return max(12.0, min(150.0, 2.0 * self._rt_err))
 +
 +    def _tpc_solve_chunk(
-+        self, d: int, eff_min: float | None,
++        self,
++        d: int,
++        eff_min: float | None,
 +    ) -> int | None:
 +        """v3 chunk sizing: the largest R such that the whole mixed batch
 +        returns within the tightest effective decode budget. The decode
@@ -1835,10 +2015,13 @@ index 889232c3e4..e75bca9d82 100644
 +        token's hi step queues behind it, so both are inside the gate."""
 +        if eff_min is None:
 +            return None
-+        budget = (eff_min + self._tpc_gate_ms - self._tpc_eps()
-+                  - (self._rt_predict(d) if d else 0.0))
-+        hard_cap = max(
-+            self._tpc_min_rows, int(self._tpc_dip_ms / self._tpc_row_ms))
++        budget = (
++            eff_min
++            + self._tpc_gate_ms
++            - self._tpc_eps()
++            - (self._rt_predict(d) if d else 0.0)
++        )
++        hard_cap = max(self._tpc_min_rows, int(self._tpc_dip_ms / self._tpc_row_ms))
 +        if budget <= 0.0:
 +            return self._tpc_min_rows
 +        rows = int((budget - self._rt_base) / max(0.02, self._rt_slope))
@@ -1858,8 +2041,7 @@ index 889232c3e4..e75bca9d82 100644
 +                data = json.load(f)
 +            # pp2: runtime-tunable net chunk cap (0 = off), else env default.
 +            nc = data.get("net_chunk")
-+            self._pp_net_chunk = (int(nc) if nc is not None
-+                                  else self._pp_net_chunk_env)
++            self._pp_net_chunk = int(nc) if nc is not None else self._pp_net_chunk_env
 +            # pp2 TP-C auto: runtime-tunable budget knobs (no restart).
 +            mode = data.get("mode")
 +            if mode in ("auto", "pred"):
@@ -1869,44 +2051,39 @@ index 889232c3e4..e75bca9d82 100644
 +            sp = data.get("split")
 +            if sp is not None:
 +                self._tpc_split = bool(int(sp))
-+            for k, attr in (("gate_ms", "_tpc_gate_ms"),
-+                            ("hi_t_ms", "_tpc_hi_t_ms"),
-+                            ("row_ms", "_tpc_row_ms"),
-+                            ("spt", "_tpc_spt"),
-+                            ("alpha", "_tpc_alpha"),
-+                            ("dip_ms", "_tpc_dip_ms"),
-+                            ("eps_ms", "_tpc_eps_ms")):
++            for k, attr in (
++                ("gate_ms", "_tpc_gate_ms"),
++                ("hi_t_ms", "_tpc_hi_t_ms"),
++                ("row_ms", "_tpc_row_ms"),
++                ("spt", "_tpc_spt"),
++                ("alpha", "_tpc_alpha"),
++                ("dip_ms", "_tpc_dip_ms"),
++                ("eps_ms", "_tpc_eps_ms"),
++            ):
 +                v = data.get(k)
 +                if v is not None:
-+                    try:
++                    with suppress(TypeError, ValueError):
 +                        setattr(self, attr, float(v))
-+                    except (TypeError, ValueError):
-+                        pass
 +        except (OSError, ValueError):
 +            pass
 +
      def _build_kv_connector_meta(
          self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
      ) -> KVConnectorMetadata:
-@@ -1123,7 +1561,16 @@ class Scheduler(SchedulerInterface):
-                 assert not scheduled_in_prev_step
+@@ -1578,7 +2023,11 @@ class Scheduler(SchedulerInterface):
                  resumed_req_ids.add(req_id)
-             if not scheduled_in_prev_step:
--                all_token_ids[req_id] = req.all_token_ids.copy()
-+                if not self._het_tok_tail:
-+                    all_token_ids[req_id] = req.all_token_ids.copy()
-+                elif not self.use_v2_model_runner:
-+                    # hetvllm: the V1 runner only reads the last
-+                    # num_output_tokens entries (async output recovery)
-+                    n = req.num_output_tokens + req.num_output_placeholders
-+                    all_token_ids[req_id] = (
-+                        req.all_token_ids[-n:] if n > 0 else [])
-+                # V2 never reads cached-request token ids (resumed requests
-+                # travel as new requests): nothing to ship
+             if not self.use_v2_model_runner:  # noqa: SIM102
+                 if req_id not in self.prev_step_scheduled_req_ids:
+-                    all_token_ids[req_id] = req.all_token_ids.copy()
++                    if self._het_tok_tail:
++                        n = req.num_output_tokens + req.num_output_placeholders
++                        all_token_ids[req_id] = req.all_token_ids[-n:] if n > 0 else []
++                    else:
++                        all_token_ids[req_id] = req.all_token_ids.copy()
              new_block_ids.append(
                  req_to_new_blocks[req_id].get_block_ids(allow_none=True)
              )
-@@ -1331,6 +1778,13 @@ class Scheduler(SchedulerInterface):
+@@ -1804,6 +2253,14 @@ class Scheduler(SchedulerInterface):
          scheduler_output: SchedulerOutput,
          model_runner_output: ModelRunnerOutput,
      ) -> dict[int, EngineCoreOutputs]:
@@ -1914,15 +2091,16 @@ index 889232c3e4..e75bca9d82 100644
 +        # sampled feedback) into the completion-time model; the batch no
 +        # longer occupies the pipeline once its output is processed.
 +        if self._tpc_pred and scheduler_output.het_t_sched:
-+            self._rt_update(scheduler_output.het_rows,
-+                            (time.monotonic()
-+                             - scheduler_output.het_t_sched) * 1000.0)
++            self._rt_update(
++                scheduler_output.het_rows,
++                (time.monotonic() - scheduler_output.het_t_sched) * 1000.0,
++            )
          sampled_token_ids = model_runner_output.sampled_token_ids
          logprobs = model_runner_output.logprobs
          prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
-@@ -1454,6 +1908,9 @@ class Scheduler(SchedulerInterface):
+@@ -1957,6 +2414,9 @@ class Scheduler(SchedulerInterface):
                  new_token_ids, stopped = self._update_request_with_output(
-                     request, new_token_ids
+                     request, new_token_ids, is_stale=output_is_stale
                  )
 +                # pp2 TP-C auto: TPOT budget clock (first sampled token).
 +                if getattr(request, "_het_dec0", None) is None:
@@ -1931,10 +2109,10 @@ index 889232c3e4..e75bca9d82 100644
                  # Pooling stops as soon as there is output.
                  request.status = RequestStatus.FINISHED_STOPPED
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 08c814ab34..9af9d497b0 100644
+index c734e67229..a113ef6a8e 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
-@@ -196,6 +196,19 @@ class EngineCore:
+@@ -214,6 +214,19 @@ class EngineCore:
          if self.batch_queue_size > 1:
              logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
              self.batch_queue = deque(maxlen=self.batch_queue_size)
@@ -1955,23 +2133,23 @@ index 08c814ab34..9af9d497b0 100644
          self.is_ec_consumer = (
              vllm_config.ec_transfer_config is None
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 052e1fe76f..fb0b08be06 100644
+index 65ea862ed7..2c309433b7 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -3,7 +3,10 @@
+@@ -3,8 +3,10 @@
  """A GPU worker class."""
  
  import gc
 +import json
  import os
-+import time
+ import time
 +from collections import deque
  from collections.abc import Callable
  from contextlib import AbstractContextManager, contextmanager, nullcontext
  from datetime import timedelta
-@@ -77,6 +80,43 @@ from .utils import request_memory
+@@ -134,6 +136,44 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int
+     return torch_reserved
  
- logger = init_logger(__name__)
  
 +# hetvllm-fork (pp2): per-step pipeline timeline. Enabled by
 +# HETVLLM_PP_TRACE=dir; each worker appends dir/worker{rank}.jsonl.
@@ -1987,8 +2165,9 @@ index 052e1fe76f..fb0b08be06 100644
 +# rates differ ~3x between schedulers, so time windows compare systems).
 +_PROF_WIN = os.environ.get("HETVLLM_PROF_STEPS")
 +_PROF_TIME = bool(_PROF_WIN) and _PROF_WIN.startswith("t")
-+_PROF_STEPS = (tuple(float(x) for x in _PROF_WIN.lstrip("t").split(":"))
-+               if _PROF_WIN else None)
++_PROF_STEPS = (
++    tuple(float(x) for x in _PROF_WIN.lstrip("t").split(":")) if _PROF_WIN else None
++)
 +
 +
 +def _pp_trace(rank: int, rec: dict) -> None:
@@ -1998,9 +2177,9 @@ index 052e1fe76f..fb0b08be06 100644
 +    if _PP_TRACE_F is None:
 +        try:
 +            os.makedirs(_PP_TRACE_DIR, exist_ok=True)
-+            _PP_TRACE_F = open(
-+                os.path.join(_PP_TRACE_DIR, f"worker{rank}.jsonl"),
-+                "a", buffering=1)
++            _PP_TRACE_F = open(  # noqa: SIM115
++                os.path.join(_PP_TRACE_DIR, f"worker{rank}.jsonl"), "a", buffering=1
++            )
 +        except OSError:
 +            return
 +    try:
@@ -2011,9 +2190,9 @@ index 052e1fe76f..fb0b08be06 100644
 +
 +
  if TYPE_CHECKING:
+     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
      from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
-     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-@@ -95,16 +135,19 @@ class AsyncIntermediateTensors(IntermediateTensors):
+@@ -153,16 +193,19 @@ class AsyncIntermediateTensors(IntermediateTensors):
          self._comm_handles = comm_handles
          self._comm_postprocess = comm_postprocess
          self._comm_waited = False
@@ -2033,9 +2212,9 @@ index 052e1fe76f..fb0b08be06 100644
          self._comm_waited = True
  
      def __getattribute__(self, name: str):
-@@ -161,6 +204,24 @@ class Worker(WorkerBase):
-         self.use_v2_model_runner = vllm_config.use_v2_model_runner
-         # pending non-blocking PP send work from the previous iteration
+@@ -219,6 +262,24 @@ class Worker(WorkerBase):
+ 
+         # Device handles of the previous step's PP intermediate-tensor send.
          self._pp_send_work: list[Handle] = []
 +        # pp2 trace state (no-ops unless HETVLLM_PP_TRACE is set)
 +        self._pp_rank_cached = -1
@@ -2056,9 +2235,9 @@ index 052e1fe76f..fb0b08be06 100644
 +        self._pp_ev_q: deque = deque()
 +        self._pp_last_exit = time.perf_counter()
  
-     def sleep(self, level: int = 1) -> None:
-         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
-@@ -800,16 +861,100 @@ class Worker(WorkerBase):
+         # Resolved lazily on first sleep/wake; persists worker-process state.
+         self._sleep_mode_backend: SleepModeBackend | None = None
+@@ -1102,7 +1163,14 @@ class Worker(WorkerBase):
      def sample_tokens(
          self, grammar_output: "GrammarOutput | None"
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -2068,18 +2247,22 @@ index 052e1fe76f..fb0b08be06 100644
 +        out = self.model_runner.sample_tokens(grammar_output)
 +        if _tr:
 +            self._pp_trace_last["sample_ms"] = round(
-+                (time.perf_counter() - _t0) * 1000.0, 3)
++                (time.perf_counter() - _t0) * 1000.0, 3
++            )
 +        return out
  
      @torch.inference_mode()
-     def execute_model(
-         self, scheduler_output: "SchedulerOutput"
+     @with_gpu_sync_check
+@@ -1111,9 +1179,96 @@ class Worker(WorkerBase):
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+         # Wait for the previous step's sends so this forward pass cannot
+         # overwrite buffers they are still reading.
 +        _tr = _PP_TRACE_DIR is not None
 +        _t_entry = time.perf_counter() if _tr else 0.0
 +        if _tr:
 +            self._pp_trace_last["idle_ms"] = round(
-+                max(0.0, _t_entry - self._pp_last_exit) * 1000.0, 3)
++                max(0.0, _t_entry - self._pp_last_exit) * 1000.0, 3
++            )
 +            ev = self._pp_ev
 +            if ev is not None:
 +                self._pp_ev_q.append(ev)
@@ -2100,8 +2283,8 @@ index 052e1fe76f..fb0b08be06 100644
 +                self._pp_trace_last["gpu_prev_ms"] = round(done_ms, 3)
 +        if _tr and self._pp_rank_cached < 0:
 +            self._pp_rank_cached = (
-+                get_pp_group().rank_in_group * 10
-+                + get_tp_group().rank_in_group)
++                get_pp_group().rank_in_group * 10 + get_tp_group().rank_in_group
++            )
 +        # hetvllm: automatic profiler window (no RPC path in DAG executor)
 +        if _PROF_STEPS is not None and self.profiler_config.profiler:
 +            if _PROF_TIME:
@@ -2110,57 +2293,64 @@ index 052e1fe76f..fb0b08be06 100644
 +                # steps followed by a long idle gap (slow load on the other
 +                # machine) must not start it, so restart it after any >5 s
 +                # gap before the window has opened
-+                if (self._prof_t0 is not None and not self._prof_on
-+                        and not self._prof_done
-+                        and _now - self._prof_last > 5.0):
++                if (
++                    self._prof_t0 is not None
++                    and not self._prof_on
++                    and not self._prof_done
++                    and _now - self._prof_last > 5.0
++                ):
 +                    self._prof_t0 = None
 +                self._prof_last = _now
-+                if (self._prof_t0 is None
-+                        and scheduler_output.total_num_scheduled_tokens):
++                if (
++                    self._prof_t0 is None
++                    and scheduler_output.total_num_scheduled_tokens
++                ):
 +                    self._prof_t0 = _now
-+                self._prof_n = (0 if self._prof_t0 is None else
-+                                time.perf_counter() - self._prof_t0)
++                self._prof_n = (
++                    0 if self._prof_t0 is None else time.perf_counter() - self._prof_t0
++                )
 +            else:
 +                self._prof_n += 1
 +            try:
-+                if (not self._prof_on and not self._prof_done
-+                        and self._prof_n >= _PROF_STEPS[0]):
++                if (
++                    not self._prof_on
++                    and not self._prof_done
++                    and self._prof_n >= _PROF_STEPS[0]
++                ):
 +                    _d = self.profiler_config.torch_profiler_dir
-+                    if _d and not os.access(
-+                            os.path.dirname(_d) or "/", os.W_OK):
++                    if _d and not os.access(os.path.dirname(_d) or "/", os.W_OK):
 +                        # cross-machine worker (stage1 on B): the head-side
 +                        # path doesn't exist here; fall back to local tmp
 +                        import tempfile
++
 +                        _fb = tempfile.gettempdir() + "/het_prof"
 +                        os.makedirs(_fb, exist_ok=True)
 +                        self.profiler_config.torch_profiler_dir = _fb
-+                        logger.info("hetvllm prof dir fallback %s -> %s",
-+                                    _d, _fb)
++                        logger.info("hetvllm prof dir fallback %s -> %s", _d, _fb)
 +                    self.profile(True)
 +                    self._prof_on = True
-+                    logger.info("hetvllm prof window start @%s",
-+                                self._prof_n)
++                    logger.info("hetvllm prof window start @%s", self._prof_n)
 +                elif self._prof_on and self._prof_n >= _PROF_STEPS[1]:
 +                    self.profile(False)
 +                    self._prof_on = False
 +                    self._prof_done = True  # one window per engine
-+                    logger.info("hetvllm prof window stop @%s",
-+                                self._prof_n)
++                    logger.info("hetvllm prof window stop @%s", self._prof_n)
 +            except Exception:  # noqa: BLE001 - profiling must never kill a step
 +                self._prof_on = False
 +                logger.warning("hetvllm prof window failed", exc_info=True)
-         # ensure any previous non-blocking PP sends are complete
++        # ensure any previous non-blocking PP sends are complete
          if self._pp_send_work:
 +            _t0 = time.perf_counter() if _tr else 0.0
              for handle in self._pp_send_work:
                  handle.wait()
 +            if _tr:
 +                self._pp_trace_last["send_wait_ms"] = round(
-+                    (time.perf_counter() - _t0) * 1000.0, 3)
++                    (time.perf_counter() - _t0) * 1000.0, 3
++                )
              self._pp_send_work = []
  
          intermediate_tensors = None
-@@ -849,6 +994,18 @@ class Worker(WorkerBase):
+@@ -1153,6 +1308,17 @@ class Worker(WorkerBase):
              }
  
          if forward_pass and not get_pp_group().is_first_rank:
@@ -2170,24 +2360,23 @@ index 052e1fe76f..fb0b08be06 100644
 +                # for was it already complete when the call started? If so,
 +                # any idle since the last exit was NOT a wire wait.
 +                from vllm.distributed import pp_link
++
 +                if pp_link.enabled() and pp_link._LINK is not None:
-+                    ok, age = pp_link._LINK.peek_ready(
-+                        pp_link._LINK.recv_sid)
++                    ok, age = pp_link._LINK.peek_ready(pp_link._LINK.recv_sid)
 +                    if ok:
-+                        self._pp_trace_last["inp_early_ms"] = round(
-+                            age * 1000.0, 3)
++                        self._pp_trace_last["inp_early_ms"] = round(age * 1000.0, 3)
              tensor_dict, comm_handles, comm_postprocess = (
                  get_pp_group().irecv_tensor_dict(
                      all_gather_group=get_tp_group(),
-@@ -861,7 +1018,16 @@ class Worker(WorkerBase):
+@@ -1165,7 +1331,17 @@ class Worker(WorkerBase):
                  comm_handles=comm_handles,
                  comm_postprocess=comm_postprocess,
              )
--
 +            if _tr:
 +                self._pp_trace_last["recv_post_ms"] = round(
-+                    (time.perf_counter() - _t0) * 1000.0, 3)
-+
++                    (time.perf_counter() - _t0) * 1000.0, 3
++                )
+ 
 +        _t_exec = time.perf_counter() if _tr else 0.0
 +        if _tr and forward_pass:
 +            ev0 = torch.cuda.Event(enable_timing=True)
@@ -2197,7 +2386,7 @@ index 052e1fe76f..fb0b08be06 100644
          with self.annotate_profile(scheduler_output):
              output = self.model_runner.execute_model(
                  scheduler_output, intermediate_tensors
-@@ -872,9 +1038,29 @@ class Worker(WorkerBase):
+@@ -1176,9 +1352,33 @@ class Worker(WorkerBase):
                  and output is None
              ):
                  output = self.model_runner.pool()  # type: ignore
@@ -2207,67 +2396,86 @@ index 052e1fe76f..fb0b08be06 100644
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
 +                if _tr:
-+                    _pp_trace(self._pp_rank_cached, {
-+                        "step": self._pp_step_counter,
-+                        "tok": scheduler_output.total_num_scheduled_tokens,
-+                        "reqs": len(scheduler_output.num_scheduled_tokens),
-+                        "exec_ms": round(
-+                            (time.perf_counter() - _t_exec) * 1000.0, 3),
-+                        "entry_ms": round(
-+                            (_t_exec - _t_entry) * 1000.0, 3),
-+                        "recv_wait_ms": getattr(
-+                            intermediate_tensors, "comm_wait_ms", None),
-+                        "send_bytes": 0,
-+                        "last": get_pp_group().is_last_rank,
-+                        **self._pp_trace_last,
-+                    })
++                    _pp_trace(
++                        self._pp_rank_cached,
++                        {
++                            "step": self._pp_step_counter,
++                            "tok": scheduler_output.total_num_scheduled_tokens,
++                            "reqs": len(scheduler_output.num_scheduled_tokens),
++                            "exec_ms": round(
++                                (time.perf_counter() - _t_exec) * 1000.0, 3
++                            ),
++                            "entry_ms": round((_t_exec - _t_entry) * 1000.0, 3),
++                            "recv_wait_ms": getattr(
++                                intermediate_tensors, "comm_wait_ms", None
++                            ),
++                            "send_bytes": 0,
++                            "last": get_pp_group().is_last_rank,
++                            **self._pp_trace_last,
++                        },
++                    )
 +                    self._pp_step_counter += 1
 +                    self._pp_trace_last = {}
 +                self._pp_last_exit = time.perf_counter()
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -885,12 +1071,38 @@ class Worker(WorkerBase):
+@@ -1188,16 +1388,50 @@ class Worker(WorkerBase):
+             and not get_pp_group().is_last_rank
          )
  
-         # launch non-blocking send of intermediate tensors
+-        # Non-blocking send of the intermediate tensors. The metadata handle
+-        # is reaped lazily by the GroupCoordinator; the device handles are
+-        # waited at the top of the next step.
++        # launch non-blocking send of intermediate tensors
 +        if _PP_TRACE_DIR is not None or os.environ.get("HETVLLM_PP_LINK"):
 +            from vllm.distributed import pp_link
++
 +            if pp_link.enabled():
 +                pp_link.set_step_hint(
 +                    scheduler_output.total_num_scheduled_tokens,
 +                    len(scheduler_output.num_scheduled_tokens),
-+                    getattr(scheduler_output, "pp_hi", None))
-         self._pp_send_work = get_pp_group().isend_tensor_dict(
++                    getattr(scheduler_output, "pp_hi", None),
++                )
+         handles = get_pp_group().isend_tensor_dict(
              output.tensors,
              all_gather_group=get_tp_group(),
              all_gather_tensors=all_gather_tensors,
          )
--
+-        self._pp_send_work = handles[1:]
++        from vllm.distributed import pp_link
+ 
++        # The link returns one payload handle; NCCL prepends a metadata handle.
++        self._pp_send_work = (
++            handles
++            if pp_link.is_link_sender(get_pp_group().rank_in_group)
++            else handles[1:]
++        )
 +        if _tr:
-+            _pp_trace(self._pp_rank_cached, {
-+                "step": self._pp_step_counter,
-+                "tok": scheduler_output.total_num_scheduled_tokens,
-+                "reqs": len(scheduler_output.num_scheduled_tokens),
-+                "exec_ms": round((time.perf_counter() - _t_exec) * 1000.0, 3),
-+                "entry_ms": round((_t_exec - _t_entry) * 1000.0, 3),
-+                "recv_wait_ms": getattr(intermediate_tensors, "comm_wait_ms",
-+                                         None),
-+                "send_bytes": sum(
-+                    t.numel() * t.element_size()
-+                    for t in output.tensors.values()),
-+                "send_n": len(self._pp_send_work),
-+                "prev_send_wait": self._pp_trace_last.pop("send_wait_ms",
-+                                                          None),
-+                **self._pp_trace_last,
-+            })
++            _pp_trace(
++                self._pp_rank_cached,
++                {
++                    "step": self._pp_step_counter,
++                    "tok": scheduler_output.total_num_scheduled_tokens,
++                    "reqs": len(scheduler_output.num_scheduled_tokens),
++                    "exec_ms": round((time.perf_counter() - _t_exec) * 1000.0, 3),
++                    "entry_ms": round((_t_exec - _t_entry) * 1000.0, 3),
++                    "recv_wait_ms": getattr(intermediate_tensors, "comm_wait_ms", None),
++                    "send_bytes": sum(
++                        t.numel() * t.element_size() for t in output.tensors.values()
++                    ),
++                    "send_n": len(self._pp_send_work),
++                    "prev_send_wait": self._pp_trace_last.pop("send_wait_ms", None),
++                    **self._pp_trace_last,
++                },
++            )
 +            self._pp_step_counter += 1
 +            self._pp_trace_last = {}
 +        self._pp_last_exit = time.perf_counter()
          return None
  
      def take_draft_token_ids(self) -> DraftTokenIds | None:
-@@ -926,7 +1138,12 @@ class Worker(WorkerBase):
+@@ -1233,7 +1467,14 @@ class Worker(WorkerBase):
                          self.profiler_config,
                          worker_name=trace_name,
                          local_rank=self.local_rank,
@@ -2275,9 +2483,11 @@ index 052e1fe76f..fb0b08be06 100644
 +                        # hetvllm: HETVLLM_PROF_CUDA_ONLY=1 = kernels only;
 +                        # CPU-op recording slows the host enough to create
 +                        # the very GPU bubbles a bubble-rate audit measures
-+                        activities=(["CUDA"] if os.environ.get(
-+                            "HETVLLM_PROF_CUDA_ONLY") == "1"
-+                            else ["CPU", "CUDA"]),
++                        activities=(
++                            ["CUDA"]
++                            if os.environ.get("HETVLLM_PROF_CUDA_ONLY") == "1"
++                            else ["CPU", "CUDA"]
++                        ),
                      )
                      logger.debug(
                          "Starting torch profiler with trace name: %s", trace_name
