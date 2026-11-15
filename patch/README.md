@@ -11,21 +11,22 @@
 - 链路优化通过 `HETVLLM_*` 启用；动态 PP 通过 `VLLM_PP_RECONFIGURE_*`
   启用。`scripts/serve.sh` 设置动态 PP 所需的运行模式。
 
-## 应用与安装（A、B 两台机器都要装）
+## 应用与安装
+
+单机动态 PP 在本机安装；双机链路部署需要在 A、B 两台机器分别安装。
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git && cd vllm
-git checkout 98dff2a81d747d1dba01a47f939f48c3526d4206
+git checkout 98dff2a81d747d1dba01a47f939f48c3526d4206          # v0.29.0
 git apply --check /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
-git apply        /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
+git apply /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
 uv venv --python 3.12 && . .venv/bin/activate
-# Pin the binary artifacts to the same release (x86_64, CUDA 12.9).
+uv pip install --python .venv/bin/python --no-deps -r requirements/runtime-cu129.txt
 WHEEL=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
-uv pip install "$WHEEL" --torch-backend=cu129
 VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
     VLLM_PRECOMPILED_WHEEL_LOCATION="$WHEEL" \
-    uv pip install -e . --torch-backend=cu129
-uv pip install ray pyzmq aiohttp matplotlib   # pyzmq：链路；后两者：回放与出图
+    uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e .
+uv pip check --python .venv/bin/python
 ```
 
 补丁包含 Python、JSON、启动脚本、固定依赖及运行文档；CUDA 内核使用
@@ -40,15 +41,9 @@ uv pip install ray pyzmq aiohttp matplotlib   # pyzmq：链路；后两者：回
 非连续 Attention、Dirty Bitmap、增量 Patch、安全 Commit 和 Migration Admission Gate。
 TEE 保留扩展接口。
 
-应用补丁后，在 vLLM 根目录使用固定依赖安装：
+完成上述安装后，在 vLLM 根目录启动：
 
 ```bash
-uv venv --python 3.12
-uv pip install --python .venv/bin/python --no-deps -r requirements/runtime-cu129.txt
-VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
-  VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl \
-  uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e .
-uv pip check --python .venv/bin/python
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/serve.sh /path/to/llama \
   --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 128 \
   --num-gpu-blocks-override 128 --gpu-memory-utilization 0.8
@@ -62,7 +57,9 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/serve.sh /path/to/llama \
 ```
 
 自动调度需要先生成与模型和 GPU 匹配的 Profiling 文件；详细参数和校准步骤见补丁内
-`docs/design/pp_reconfiguration.md`。运行产物默认写入被 Git 忽略的 `runtime/`。
+`docs/design/pp_reconfiguration.md`，也可直接查看
+[MoLink 运行指南](../docs/REPRODUCE.md#动态-pp单机双-gpu)。
+运行产物默认写入被 Git 忽略的 `runtime/`。
 服务启用开发控制接口，默认仅监听本机。
 
 ## 链路功能逐文件说明

@@ -5,7 +5,80 @@
 [UPGRADE-0.29.0.md](UPGRADE-0.29.0.md)。
 
 一键配对测试（第 4 节）约需 **2 小时**（A3B：原生默认、原生 V2、我们各约 40 分钟；
-`NATIVE_V2=0` 跳过原生 V2 时约 80 分钟），不含模型冷加载。所有命令都在 A 机执行；B 机只需装好环境，由脚本经 ssh 远程驱动。
+`NATIVE_V2=0` 跳过原生 V2 时约 80 分钟），不含模型冷加载。双机评测章节的命令都在 A 机执行；B 机只需装好环境，由脚本经 ssh 远程驱动。
+
+## 动态 PP：单机双 GPU
+
+先完成第 1 节的基础安装；单机只需安装一次。此路径使用本地 Llama、PP2/TP1、
+BF16、V2、eager 和 Triton Attention，在应用补丁后的 vLLM 根目录执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/serve.sh /path/to/llama \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 128 \
+  --num-gpu-blocks-override 128 --gpu-memory-utilization 0.8
+```
+
+默认服务地址为 `http://127.0.0.1:8000`。容器只有 64 MiB `/dev/shm` 时，
+在启动与通信校准前一致设置：
+
+```bash
+export NCCL_BUFFSIZE=1048576 NCCL_SHM_DISABLE=0 VLLM_MQ_MAX_CHUNK_BYTES_MB=1
+```
+
+启动脚本默认设置 `VLLM_PP_RECONFIGURE_STACK_SIZE=2`。
+`VLLM_PP_LAYER_PARTITION=16,16` 可显式指定 32 层模型的初始切分。
+服务启用开发控制接口，默认仅监听本机；端口可通过 `--port` 修改。
+
+在另一终端检查请求和手动迁移：
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"/path/to/llama","prompt":"The capital of France is","max_tokens":32,"temperature":0}'
+.venv/bin/python -m vllm.distributed.pp_reconfigure monitor --samples 1
+.venv/bin/python -m vllm.distributed.pp_reconfigure reconfigure --boundary 18
+```
+
+边界必须是 stack 对齐的内部层号。默认控制命令执行完整异步迁移；
+`18` 对应 32 层模型的 `18/14`，不是所有模型都能使用此值。
+权重和 KV 迁移、Dirty Bitmap、增量 Patch、安全 Commit 由运行时完成。
+Admission Gate 使用有期限的租约控制新请求进入，已运行请求继续执行。
+
+### Profiling 与自动调度
+
+先在空闲设备上校准通信，GPU 顺序和 NCCL 环境应与服务一致：
+
+```bash
+mkdir -p runtime/profile
+CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run --nproc-per-node 2 \
+  -m vllm.distributed.pp_reconfigure.network_profile --output runtime/profile/network.json
+```
+
+然后按上述命令启动专用校准服务，运行：
+
+```bash
+.venv/bin/python -m vllm.distributed.pp_reconfigure.profile \
+  --model /path/to/llama --stack 2 --out runtime/profile
+```
+
+校准会发送请求并遍历合法切分，结束后恢复初始切分。匹配的完整校准文件默认复用，
+`--force` 重新采样。完成后停止校准服务，重启时设置：
+
+```bash
+export VLLM_PP_ADAPTIVE_PROFILE="$PWD/runtime/profile/profile.json"
+export VLLM_PP_ADAPTIVE_INTERVAL=5
+export VLLM_PP_ADAPTIVE_CONFIG='{"horizon":60,"cooldown":30,"min_gain":0.05}'
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/serve.sh /path/to/llama \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 128 \
+  --num-gpu-blocks-override 128 --gpu-memory-utilization 0.8
+```
+
+通过 `GET /molink/adaptive/status` 查看决策状态。模型配置、dtype、stack 和 GPU UUID
+需要匹配；缺少有效采样或预期收益不足时保持切分。迁移异常后自动调度锁止，
+需检查日志并重启。日志和校准数据默认写入 `runtime/`。
+完整参数说明随补丁安装到 `docs/design/pp_reconfiguration.md`。
+
+以下编号章节介绍双机链路优化与历史评测工具；该工具通过 `kit/het.py` 启动 Ray 集群。
 
 ## 0. 硬件与软件（我们的测试环境）
 
@@ -23,15 +96,21 @@
 ```bash
 git clone https://github.com/vllm-project/vllm.git && cd vllm
 git checkout 98dff2a81d747d1dba01a47f939f48c3526d4206          # v0.29.0
+git apply --check /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
 git apply /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
 uv venv --python 3.12 && . .venv/bin/activate
-# Pin the binary artifacts to the same release (x86_64, CUDA 12.9).
+uv pip install --python .venv/bin/python --no-deps -r requirements/runtime-cu129.txt
 WHEEL=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
-uv pip install "$WHEEL" --torch-backend=cu129
 VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
     VLLM_PRECOMPILED_WHEEL_LOCATION="$WHEEL" \
-    uv pip install -e . --torch-backend=cu129
-uv pip install ray pyzmq aiohttp matplotlib
+    uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e .
+uv pip check --python .venv/bin/python
+```
+
+双机评测工具额外安装 `ray`、`aiohttp`、`matplotlib`（`pyzmq` 已在运行时依赖中）：
+
+```bash
+uv pip install --python .venv/bin/python ray aiohttp matplotlib
 ```
 
 模型：`Qwen/Qwen3-30B-A3B`（BF16）；可选 `Qwen/Qwen3-32B`（§6.1）、`Qwen/Qwen3-8B`（§6.3、§7.4）。**两台机器上的绝对路径必须相同**

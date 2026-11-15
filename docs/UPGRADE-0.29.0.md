@@ -5,6 +5,27 @@
 [README](../README.md#quick-start)，补丁见
 [`patch/`](../patch/README.md)。
 
+## 当前动态 PP 版本
+
+当前补丁对应 Runtime 提交
+[`0358302773`](https://github.com/zhuoyf/MoLink-runtime/commit/03583027739f8446dbd2007ec5d55f9f75dfdc6c)，
+包含动态分层调度、Profiling、权重和 KV 在线迁移、Layer Stacking、
+非连续 Attention、Dirty Bitmap、增量 Patch、安全 Commit 与 Admission Gate。
+安装与启动入口见 [复现指南](REPRODUCE.md#动态-pp单机双-gpu)。
+
+2026-11-15 在 2×RTX 3090 Ti、Llama-2-7B-Chat、BF16、PP2/TP1、V2、eager、
+Triton Attention 上完成必要功能检查，使用 `max_model_len=512`、
+`max_num_seqs=8`、`max_num_batched_tokens=128`、128 个 KV blocks：
+
+- 静态推理与 `16/16 → 18/14 → 16/16` 双向在线迁移通过。
+- 迁移期间请求持续生成，生成 token 与静态基线一致，两端 KV 摘要一致。
+- KV 缩扩容、容量预检、Admission Gate 租约到期恢复、非法切分后的继续生成通过。
+- 往返迁移后的实际分配显存恢复，停止测试服务后 GPU 显存恢复基线。
+- 仓库外执行的调度、迁移和准入回归共 185 项通过；临时测试及日志已清理。
+- 补丁应用到上游基线后的 Git tree 与上述实测 Runtime 提交一致。
+
+这组检查不包含长时间性能测量。下文保留 2026-11-05 的链路升级验证记录。
+
 ## 适配内容
 
 - 保留新调度器的输入预算、Mamba 对齐、KV cache 和推测解码字段，移植 TP-C 调度及反馈。
