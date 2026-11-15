@@ -3,10 +3,13 @@
 - **基线**：上游 vLLM `v0.29.0`，commit `98dff2a81d747d1dba01a47f939f48c3526d4206`
   （https://github.com/vllm-project/vllm）。
 - **补丁**：`hetvllm-vllm-v0.29.0.patch`（`git diff --binary`，含运行时代码与回归测试，
-  逐文件统计见 `DIFFSTAT.txt`）。验证步骤和实测结果见
+  逐文件统计见 `DIFFSTAT.txt`）。
+- **Runtime 来源**：`release/dynamic-pp-0.29.0`，commit
+  `03583027739f8446dbd2007ec5d55f9f75dfdc6c`。补丁应用后的 Git tree 与该提交完全一致。
+- 旧版链路功能的升级验证记录见
   [`../docs/UPGRADE-0.29.0.md`](../docs/UPGRADE-0.29.0.md)。
-- 所有改动默认关闭：不设 `HETVLLM_*` 环境变量时，行为与上游 v0.29.0 相同
-  （包括基线 native 的跑法）。
+- 链路优化通过 `HETVLLM_*` 启用；动态 PP 通过 `VLLM_PP_RECONFIGURE_*`
+  启用。`scripts/serve.sh` 设置动态 PP 所需的运行模式。
 
 ## 应用与安装（A、B 两台机器都要装）
 
@@ -25,11 +28,44 @@ VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
 uv pip install ray pyzmq aiohttp matplotlib   # pyzmq：链路；后两者：回放与出图
 ```
 
-补丁只改 Python 和 JSON 文件，所以预编译 wheel（`VLLM_USE_PRECOMPILED=1`）就够用。
+补丁包含 Python、JSON、启动脚本、固定依赖及运行文档；CUDA 内核使用
+同版本预编译 wheel（`VLLM_USE_PRECOMPILED=1`）。
 链路的边界张量要求 BF16；`kit/het.py` 显式传入 `--dtype bfloat16`。
 使用与 0.29.0 wheel 匹配的 torch 2.13.0+cu129 和 Transformers 5；实际验证环境见升级记录。
 
-## 逐文件说明
+## 动态 PP 运行
+
+动态 PP 路径支持本地 Llama、PP2/TP1、BF16、V2 Model Runner、eager 与 Triton Attention。
+包含异构 GPU Profiling、成本模型与切分选择、在线权重/KV 迁移、Layer Stacking、
+非连续 Attention、Dirty Bitmap、增量 Patch、安全 Commit 和 Migration Admission Gate。
+TEE 保留扩展接口。
+
+应用补丁后，在 vLLM 根目录使用固定依赖安装：
+
+```bash
+uv venv --python 3.12
+uv pip install --python .venv/bin/python --no-deps -r requirements/runtime-cu129.txt
+VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
+  VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl \
+  uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e .
+uv pip check --python .venv/bin/python
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/serve.sh /path/to/llama \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 128 \
+  --num-gpu-blocks-override 128 --gpu-memory-utilization 0.8
+```
+
+默认监听 `127.0.0.1:8000`。32 层模型可通过以下命令切换至 `18/14`：
+
+```bash
+.venv/bin/python -m vllm.distributed.pp_reconfigure monitor --samples 1
+.venv/bin/python -m vllm.distributed.pp_reconfigure reconfigure --boundary 18
+```
+
+自动调度需要先生成与模型和 GPU 匹配的 Profiling 文件；详细参数和校准步骤见补丁内
+`docs/design/pp_reconfiguration.md`。运行产物默认写入被 Git 忽略的 `runtime/`。
+服务启用开发控制接口，默认仅监听本机。
+
+## 链路功能逐文件说明
 
 | 文件 | 作用 | 对应技术 |
 |---|---|---|
