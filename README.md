@@ -13,6 +13,12 @@
 instead of the gRPC-based engine fork of v1. It targets one specific problem: with pipeline parallelism over a
 slow link (100 Mbps – 1 Gbps), the activation transfer between stages dominates every step, and the GPUs sit idle.
 
+This branch also includes **dynamic PP**: GPU-aware profiling and partition selection,
+online weight/KV migration, non-contiguous attention, layer stacking, and migration admission control.
+The patch tracks Runtime release commit [`00eef439c3`](https://github.com/zhuoyf/MoLink-runtime/commit/00eef439c33f1c4f5305120d49e3fc042062575a)
+plus the admission validation fix documented in the [release validation](docs/UPGRADE-0.29.0.md#当前动态-pp-版本).
+The dynamic path supports local Llama, PP2/TP1, BF16, V2, eager execution and Triton Attention.
+
 ## What v2 changes
 
 | Technique | What it does |
@@ -24,7 +30,8 @@ slow link (100 Mbps – 1 Gbps), the activation transfer between stages dominate
 | **Control-plane trimming** (`--tok-tail`) | Upstream 0.29.0 already omits cached token lists for V2; the switch retains tail-only payloads for V1. |
 | **Predictive chunk scheduler** (optional, `--best-tpc`) | Fits step latency online and sizes prefill chunks to protect decode latency. |
 
-Every change is off unless a `HETVLLM_*` environment variable is set, so without them the patched tree behaves like upstream v0.29.0.
+Link optimizations use `HETVLLM_*`; dynamic PP uses `VLLM_PP_RECONFIGURE_*`.
+The dynamic launcher `scripts/serve.sh` sets the required runtime options. Automatic partition scheduling additionally requires a matching profile.
 
 ## Results (headline)
 
@@ -48,36 +55,51 @@ All numbers are from one cluster and one snapshot of the code; they do not trans
 
 ## Quick start
 
+Install the patch and pinned Python 3.12 / CUDA 12.9 dependencies:
+
 ```bash
-# on BOTH machines
 git clone https://github.com/vllm-project/vllm.git && cd vllm
 git checkout 98dff2a81d747d1dba01a47f939f48c3526d4206          # v0.29.0
+git apply --check /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
 git apply /path/to/MoLink/patch/hetvllm-vllm-v0.29.0.patch
 uv venv --python 3.12 && . .venv/bin/activate
-# Pin the binary artifacts to the same release (x86_64, CUDA 12.9).
+uv pip install --python .venv/bin/python --no-deps -r requirements/runtime-cu129.txt
 WHEEL=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
-uv pip install "$WHEEL" --torch-backend=cu129
 VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129 VLLM_USE_PRECOMPILED=1 \
     VLLM_PRECOMPILED_WHEEL_LOCATION="$WHEEL" \
-    uv pip install -e . --torch-backend=cu129
-uv pip install ray pyzmq aiohttp matplotlib
-
-# on machine A: describe the cluster, then start the engine with the final configuration
-cd MoLink/kit && cp cluster.env.example cluster.env && $EDITOR cluster.env
-set -a; . ./cluster.env; set +a
-python het.py up                      # ray: A is head, B joins
-python het.py start --best && python het.py wait
+    uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e .
+uv pip check --python .venv/bin/python
 ```
 
-Machine B must be reachable by key-based, non-interactive ssh. The full procedure (one-shot paired benchmark, ablation,
-bubble-rate and accuracy runs, expected results and tolerances) is in [docs/REPRODUCE.md](docs/REPRODUCE.md).
+For dynamic PP on two local GPUs, run from the patched vLLM directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/serve.sh /path/to/llama \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 128 \
+  --num-gpu-blocks-override 128 --gpu-memory-utilization 0.8
+```
+
+The server listens on `127.0.0.1:8000`. It starts with a fixed partition and supports online changes:
+
+```bash
+.venv/bin/python -m vllm.distributed.pp_reconfigure monitor --samples 1
+.venv/bin/python -m vllm.distributed.pp_reconfigure reconfigure --boundary 18
+```
+
+For a 32-layer Llama, boundary 18 selects an `18/14` partition. See the
+[dynamic PP guide](docs/REPRODUCE.md#动态-pp单机双-gpu) for profiling, automatic scheduling,
+container shared-memory settings and runtime constraints. TEE support is an extension interface only.
+
+The two-machine link-optimization kit uses Ray and its own cluster configuration.
+Install the patched runtime on both machines, then follow
+[the cluster instructions](docs/REPRODUCE.md#2-配置). Machine B requires key-based SSH access.
 
 ## Repository layout
 
 ```
 README.md              this file
 docs/EVALUATION.md     full report: method, techniques, results, ablation, accuracy, limitations
-docs/REPRODUCE.md      install, configure, run, expected results
+docs/REPRODUCE.md      dynamic PP setup and two-machine kit instructions
 patch/                 patch against vLLM v0.29.0 + per-file notes and env-var reference
 kit/                   cluster launcher, benchmark/replay, ablation, bubble-rate and accuracy tools
 data/                  raw replay JSON and summary CSVs behind every number and figure
