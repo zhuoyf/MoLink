@@ -15,7 +15,8 @@ slow link (100 Mbps – 1 Gbps), the activation transfer between stages dominate
 
 This branch also includes **dynamic PP**: GPU-aware profiling and partition selection,
 online weight/KV migration, non-contiguous attention, layer stacking, and migration admission control.
-The patch tracks Runtime commit [`0358302773`](https://github.com/zhuoyf/MoLink-runtime/commit/03583027739f8446dbd2007ec5d55f9f75dfdc6c).
+The patch tracks Runtime release commit [`00eef439c3`](https://github.com/zhuoyf/MoLink-runtime/commit/00eef439c33f1c4f5305120d49e3fc042062575a)
+plus the admission validation fix documented in the [release validation](docs/UPGRADE-0.29.0.md#当前动态-pp-版本).
 The dynamic path supports local Llama, PP2/TP1, BF16, V2, eager execution and Triton Attention.
 
 ## What v2 changes

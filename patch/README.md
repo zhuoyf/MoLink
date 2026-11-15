@@ -5,7 +5,11 @@
 - **补丁**：`hetvllm-vllm-v0.29.0.patch`（`git diff --binary`，含运行时代码与回归测试，
   逐文件统计见 `DIFFSTAT.txt`）。
 - **Runtime 来源**：`release/dynamic-pp-0.29.0`，commit
-  `03583027739f8446dbd2007ec5d55f9f75dfdc6c`。补丁应用后的 Git tree 与该提交完全一致。
+  `00eef439c33f1c4f5305120d49e3fc042062575a`，加上本次 Admission Gate 校验异常修复及回归测试。
+  补丁应用后的 Git tree 为
+  `f58512ea2b1091b7506fea75ebf357976e363744`，与实测源码一致。
+- **Release 验证**：2026-11-15，89 项回归、17 项双卡功能检查及修复文件的 pre-commit 通过；
+  结果见 [`dynamic-pp-release-0.29.0.json`](../data/validation/dynamic-pp-release-0.29.0.json)。
 - 旧版链路功能的升级验证记录见
   [`../docs/UPGRADE-0.29.0.md`](../docs/UPGRADE-0.29.0.md)。
 - 链路优化通过 `HETVLLM_*` 启用；动态 PP 通过 `VLLM_PP_RECONFIGURE_*`

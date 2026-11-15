@@ -7,24 +7,40 @@
 
 ## 当前动态 PP 版本
 
-当前补丁对应 Runtime 提交
-[`0358302773`](https://github.com/zhuoyf/MoLink-runtime/commit/03583027739f8446dbd2007ec5d55f9f75dfdc6c)，
-包含动态分层调度、Profiling、权重和 KV 在线迁移、Layer Stacking、
+当前补丁来自 Runtime release 提交
+[`00eef439c3`](https://github.com/zhuoyf/MoLink-runtime/commit/00eef439c33f1c4f5305120d49e3fc042062575a)，
+包含本次 Admission Gate 校验异常修复及回归测试，
+补丁对应实测 Git tree `f58512ea2b1091b7506fea75ebf357976e363744`。
+运行时包含动态分层调度、Profiling、权重和 KV 在线迁移、Layer Stacking、
 非连续 Attention、Dirty Bitmap、增量 Patch、安全 Commit 与 Admission Gate。
 安装与启动入口见 [复现指南](REPRODUCE.md#动态-pp单机双-gpu)。
 
-2026-11-15 在 2×RTX 3090 Ti、Llama-2-7B-Chat、BF16、PP2/TP1、V2、eager、
-Triton Attention 上完成必要功能检查，使用 `max_model_len=512`、
+2026-11-15 对当前 release 重新启动并验证，在 2×RTX 3090 Ti、Llama-2-7B-Chat、
+BF16、PP2/TP1、V2、eager、Triton Attention 上完成 17 项功能检查，使用 `max_model_len=512`、
 `max_num_seqs=8`、`max_num_batched_tokens=128`、128 个 KV blocks：
 
 - 静态推理与 `16/16 → 18/14 → 16/16` 双向在线迁移通过。
-- 迁移期间请求持续生成，生成 token 与静态基线一致，两端 KV 摘要一致。
-- KV 缩扩容、容量预检、Admission Gate 租约到期恢复、非法切分后的继续生成通过。
+- 每个迁移方向运行 2 个并发请求、各生成 256 token；合计 1024 个迁移期间生成的 token
+  与静态基线完全一致，两端 KV 摘要一致。两个方向分别记录到 11、17 个迁移期间推理步。
+- KV `128 → 96 → 128` 缩扩容、容量预检、非法切分拒绝后的继续生成通过。
+- Admission Gate 阻止新请求，租约到期后恢复；错误 owner 操作返回 409。
+  复测时发现原 release 的校验异常经 RPC 后变成 500，现改用现有的
+  `ReconfigurationValidationError` 保留错误分类，并增加 5 项回归。
+- 流式输出、断连后继续生成、长提示词分块 prefill、资源监控及手动模式调度状态通过。
 - 往返迁移后的实际分配显存恢复，停止测试服务后 GPU 显存恢复基线。
-- 仓库外执行的调度、迁移和准入回归共 185 项通过；临时测试及日志已清理。
-- 补丁应用到上游基线后的 Git tree 与上述实测 Runtime 提交一致。
+- 调度、环境变量、Worker RPC 和准入回归共 89 项通过；修复文件的 pre-commit 全部通过。
+- 补丁应用到上游基线后，经 `git apply --cached --check` 和 `git write-tree`
+  验证，Git tree 与实测源码一致。
 
-这组检查不包含长时间性能测量。下文保留 2026-11-05 的链路升级验证记录。
+环境、token、KV 校验与检查结果保存在
+[`dynamic-pp-release-0.29.0.json`](../data/validation/dynamic-pp-release-0.29.0.json)。
+本次服务直接使用容器的 64 MiB `/dev/shm`，设置
+`NCCL_BUFFSIZE=1048576`、`NCCL_SHM_DISABLE=0`、`VLLM_MQ_MAX_CHUNK_BYTES_MB=1`。
+详细脚本和日志保留在工作区 `/workspace/runs/release-00eef439c3-20261115/`；
+回归命令见结果 JSON 的 `regression_commands`。
+
+这组检查不包含跨机部署、CUDA graphs、匹配校准文件的自动调度、长时间性能或全量精度测量。
+下文保留 2026-11-05 的链路升级验证记录。
 
 ## 适配内容
 

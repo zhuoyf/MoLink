@@ -5,6 +5,7 @@
  tests/test_envs.py                                 |  22 +
  tests/v1/core/test_async_scheduler.py              |   1 +
  tests/v1/core/test_scheduler.py                    |  94 +-
+ tests/v1/engine/test_admission_control.py          |  31 +
  tests/v1/executor/test_multiproc_executor.py       |  22 +
  tests/v1/worker/test_gpu_worker.py                 |   9 +-
  vllm/distributed/parallel_state.py                 |  40 +-
@@ -16,7 +17,7 @@
  .../pp_reconfigure/adaptive/optimizer.py           | 316 +++++++
  .../distributed/pp_reconfigure/adaptive/runtime.py | 433 ++++++++++
  .../pp_reconfigure/adaptive/security.py            |  52 ++
- vllm/distributed/pp_reconfigure/admission.py       |  93 ++
+ vllm/distributed/pp_reconfigure/admission.py       | 101 +++
  vllm/distributed/pp_reconfigure/cache.py           | 139 +++
  vllm/distributed/pp_reconfigure/communication.py   | 175 ++++
  vllm/distributed/pp_reconfigure/control.py         | 386 +++++++++
@@ -52,4 +53,4 @@
  vllm/v1/worker/gpu/model_runner.py                 |   6 +
  vllm/v1/worker/gpu_worker.py                       | 387 ++++++++-
  vllm/v1/worker/utils.py                            |  19 +
- 54 files changed, 7745 insertions(+), 20 deletions(-)
+ 55 files changed, 7784 insertions(+), 20 deletions(-)

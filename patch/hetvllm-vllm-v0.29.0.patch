@@ -530,6 +530,48 @@ index c630abe4f303e9682f8aa406c2f96f4a21641952..90f67a5d686838be6ab5979831598d4b
 +    scheduler.finish_requests(new.request_id, RequestStatus.FINISHED_ABORTED)
 +    gate.update("close", "test")
 +    assert new.request_id not in scheduler.requests
+diff --git a/tests/v1/engine/test_admission_control.py b/tests/v1/engine/test_admission_control.py
+index a03718ab5a1508f111244b937d5a2728caf0391e..15d236bdbb448f990b45aa0d41eca82c99fe4f74 100644
+--- a/tests/v1/engine/test_admission_control.py
++++ b/tests/v1/engine/test_admission_control.py
+@@ -39,6 +39,37 @@ from vllm.v1.engine.output_processor import OutputProcessor
+ 
+ pytestmark = pytest.mark.cpu_test
+ 
++
++@pytest.mark.parametrize(
++    "action,owner,timeout",
++    [
++        ("close", "other-owner", 10),
++        ("renew", "other-owner", 10),
++        ("open", "owner", 10),
++        ("renew", "owner", float("nan")),
++        ("close", "", 10),
++    ],
++)
++def test_migration_admission_rejections_preserve_rpc_validation_category(
++    action, owner, timeout
++):
++    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
++    from vllm.v1.engine import UtilityOutput
++    from vllm.v1.engine.core import EngineCoreProc
++
++    gate = MigrationAdmissionGate()
++    gate.update("open", "owner", 60)
++    outputs: list[UtilityOutput] = []
++    EngineCoreProc._invoke_utility_method(
++        "molink_admission_gate",
++        lambda: gate.update(action, owner, timeout),
++        UtilityOutput(1),
++        outputs.append,
++    )
++    assert outputs[0].failure_category == "validation"
++    assert gate.status()["owner"] == "owner"
++
++
+ # ---------------------------------------------------------------------------
+ # Helpers
+ # ---------------------------------------------------------------------------
 diff --git a/tests/v1/executor/test_multiproc_executor.py b/tests/v1/executor/test_multiproc_executor.py
 index 4ebaba5f1177f4f82c8bca8c613e68a294c0c93c..5e89f6909eea0c4a2cd0f2d4321fc03967e2ee30 100644
 --- a/tests/v1/executor/test_multiproc_executor.py
@@ -2863,16 +2905,18 @@ index 0000000000000000000000000000000000000000..727aafc8ade376891af12516858e556f
 +        return 0.0
 diff --git a/vllm/distributed/pp_reconfigure/admission.py b/vllm/distributed/pp_reconfigure/admission.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2087b45323ef27f7ca2fa2187d3abee56e4049c0
+index 0000000000000000000000000000000000000000..fa0ac2b5fa23adc092ee560b16baf9ab9e368814
 --- /dev/null
 +++ b/vllm/distributed/pp_reconfigure/admission.py
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,101 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Engine-owned admission lease; independent of scheduler pause/resume."""
 +
 +import math
 +import time
++
++from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 +
 +
 +class MigrationAdmissionGate:
@@ -2921,12 +2965,16 @@ index 0000000000000000000000000000000000000000..2087b45323ef27f7ca2fa2187d3abee5
 +    def update(self, action, owner, timeout=10, requests=()):
 +        self.status()
 +        if not isinstance(owner, str) or not owner:
-+            raise ValueError("admission lease requires an owner")
++            raise ReconfigurationValidationError("admission lease requires an owner")
 +        if action == "open":
 +            if not math.isfinite(timeout) or not 0 < timeout <= 600:
-+                raise ValueError("admission timeout must be in (0, 600]")
++                raise ReconfigurationValidationError(
++                    "admission timeout must be in (0, 600]"
++                )
 +            if self.owner is not None:
-+                raise ValueError("migration admission gate already owned")
++                raise ReconfigurationValidationError(
++                    "migration admission gate already owned"
++                )
 +            self.owner = owner
 +            self.started = time.monotonic()
 +            self.deadline = self.started + timeout
@@ -2947,15 +2995,17 @@ index 0000000000000000000000000000000000000000..2087b45323ef27f7ca2fa2187d3abee5
 +                or not math.isfinite(timeout)
 +                or not 0 < timeout <= 600
 +            ):
-+                raise ValueError("invalid admission lease renewal")
++                raise ReconfigurationValidationError("invalid admission lease renewal")
 +            self.deadline = time.monotonic() + timeout
 +        elif action == "close":
 +            if self.owner is not None and self.owner != owner:
-+                raise ValueError("migration admission gate owner mismatch")
++                raise ReconfigurationValidationError(
++                    "migration admission gate owner mismatch"
++                )
 +            if self.owner is not None:
 +                self._close("released")
 +        else:
-+            raise ValueError("unknown admission action")
++            raise ReconfigurationValidationError("unknown admission action")
 +        return self.status()
 +
 +    def allows(self, request):
